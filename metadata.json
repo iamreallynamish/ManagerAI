@@ -1,0 +1,6 @@
+{
+  "name": "Kairo",
+  "description": "Conversational personal awareness manager combining verified Spend IQ transactions, Google Calendar, Google Classroom, and life admin reminders.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

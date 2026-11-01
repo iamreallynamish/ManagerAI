@@ -1,0 +1,42 @@
+{
+  "userState": {
+    "default": {
+      "last_checked_at": 1793519392254,
+      "updated_at": 1793526592254
+    },
+    "namish": {
+      "last_checked_at": 1793519392254,
+      "updated_at": 1793526592254
+    }
+  },
+  "reminders": [
+    {
+      "id": "rem_india_flights",
+      "user_id": "default",
+      "title": "Book India flights",
+      "details": "Target booking window: Nov 8–21 · Outbound Jan 5, 2027, Return Apr 5, 2027",
+      "target_date": "2026-11-21",
+      "target_date_flexibility": "week_of",
+      "status": "active",
+      "priority": "high",
+      "created_at": 1793440192254,
+      "updated_at": 1793440192254,
+      "completed_at": null,
+      "is_travel": true,
+      "flights_booked": false,
+      "travel_start_date": "2027-01-05",
+      "travel_end_date": "2027-04-05",
+      "completed": false,
+      "context": "Target booking window: Nov 8–21 · Outbound Jan 5, Return Apr 5",
+      "dueDate": "2026-11-21"
+    }
+  ],
+  "snapshots": {
+    "calendarEvents": {},
+    "assignments": {},
+    "txIds": [
+      "tx-1793013678304-0-0il",
+      "tx-1792981443616-0-dc5"
+    ]
+  }
+}

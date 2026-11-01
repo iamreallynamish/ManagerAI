@@ -1,0 +1,32 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --font-apple: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "SF Pro", system-ui, sans-serif;
+    --font-apple-mono: "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  }
+
+  body {
+    font-family: var(--font-apple);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+
+  code, pre, .font-mono {
+    font-family: var(--font-apple-mono);
+  }
+}
+
+/* iOS Safe Area Padding Helpers */
+.pt-safe {
+  padding-top: max(env(safe-area-inset-top, 0px), 12px);
+}
+.pb-safe {
+  padding-bottom: max(env(safe-area-inset-bottom, 0px), 16px);
+}
+.pb-safe-nav {
+  padding-bottom: max(calc(env(safe-area-inset-bottom, 0px) + 24px), 32px);
+}
