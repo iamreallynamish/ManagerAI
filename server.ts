@@ -10,6 +10,11 @@ import {
   SinceLastCheckedItem,
   WeeklyRecapData,
 } from './src/types/activity.js';
+import {
+  WATCHLIST_REGISTRY,
+  getNseMarketStatus,
+  validateMarketQuote,
+} from './src/services/stockService.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -300,36 +305,22 @@ app.delete('/api/reminders/:id', (req: Request, res: Response) => {
   return res.status(200).json({ success: true, reminders: store.reminders });
 });
 
-// --- 3. STOCK WATCHLIST SERVICE ---
-// Monitored tickers:
-// Jio Financial (JIOFIN.NS)
-// Persistent Systems (PERSISTENT.NS)
-// Larsen & Toubro (LT.NS)
-// Tata Consumer Products (TATACONSUM.NS)
-// Apollo Hospitals (APOLLOHOSP.NS)
-const WATCHLIST = [
-  { symbol: 'JIOFIN.NS', name: 'Jio Financial' },
-  { symbol: 'PERSISTENT.NS', name: 'Persistent Systems' },
-  { symbol: 'LT.NS', name: 'Larsen & Toubro' },
-  { symbol: 'TATACONSUM.NS', name: 'Tata Consumer' },
-  { symbol: 'APOLLOHOSP.NS', name: 'Apollo Hospitals' },
-];
-
+// --- 3. VERIFIED STOCK WATCHLIST SERVICE & VALIDATION PIPELINE ---
 let stockCache: { quotes: StockQuote[]; timestamp: number } | null = null;
-const STOCK_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+const STOCK_CACHE_TTL = 3 * 60 * 1000; // 3 minutes
 
 async function fetchWatchlistQuotes(): Promise<StockQuote[]> {
-  const now = Date.now();
-  if (stockCache && now - stockCache.timestamp < STOCK_CACHE_TTL) {
+  const now = new Date();
+  if (stockCache && now.getTime() - stockCache.timestamp < STOCK_CACHE_TTL) {
     return stockCache.quotes;
   }
 
   const quotes: StockQuote[] = [];
 
-  for (const item of WATCHLIST) {
+  for (const item of WATCHLIST_REGISTRY) {
     try {
       const url = `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
-        item.symbol
+        item.dataProviderSymbol
       )}?range=2d&interval=1d`;
       const resp = await fetch(url, {
         headers: {
@@ -338,34 +329,51 @@ async function fetchWatchlistQuotes(): Promise<StockQuote[]> {
         },
       });
 
-      if (!resp.ok) continue;
+      if (!resp.ok) {
+        console.warn(`Market provider returned HTTP ${resp.status} for ${item.dataProviderSymbol}`);
+        continue;
+      }
 
       const data = await resp.json();
       const meta = data?.chart?.result?.[0]?.meta;
       if (!meta) continue;
 
-      const price = meta.regularMarketPrice || 0;
-      const prevClose = meta.chartPreviousClose || meta.previousClose || price;
-      const changePct = prevClose > 0 ? ((price - prevClose) / prevClose) * 100 : 0;
-      const meaningful = Math.abs(changePct) >= 3.0;
+      // Run strict validation pipeline: verify ticker, price, freshness, and previous close
+      const validation = validateMarketQuote(item, meta, now);
+      if (!validation.valid || !validation.quote) {
+        console.warn(`Market data validation rejected for ${item.ticker}: ${validation.reason}`);
+        continue;
+      }
 
+      const vq = validation.quote;
       quotes.push({
-        symbol: item.symbol,
-        name: item.name,
-        price,
-        changePct,
-        currency: meta.currency || 'INR',
-        meaningful,
-        dayHigh: meta.regularMarketDayHigh,
-        dayLow: meta.regularMarketDayLow,
+        ticker: vq.ticker,
+        exchange: vq.exchange,
+        symbol: vq.dataProviderSymbol,
+        name: vq.companyName,
+        companyName: vq.companyName,
+        isin: vq.isin,
+        price: vq.price,
+        previousClose: vq.previousClose,
+        changePct: vq.changePct,
+        currency: vq.currency,
+        marketSessionDate: vq.marketSessionDate,
+        isMarketOpen: vq.isMarketOpen,
+        marketStatusText: vq.marketStatusText,
+        sessionLabel: vq.isMarketOpen ? 'Live Session' : 'Last Session',
+        meaningful: vq.meaningful,
+        dayHigh: vq.dayHigh,
+        dayLow: vq.dayLow,
+        verifiedAt: vq.verifiedAt,
+        dataProvider: vq.dataProvider,
       });
-    } catch (err) {
-      console.warn(`Failed to fetch quote for ${item.symbol}:`, err);
+    } catch (err: any) {
+      console.warn(`Failed to fetch verified quote for ${item.ticker} (${item.dataProviderSymbol}):`, err.message);
     }
   }
 
   if (quotes.length > 0) {
-    stockCache = { quotes, timestamp: now };
+    stockCache = { quotes, timestamp: now.getTime() };
   }
 
   return quotes;
@@ -377,44 +385,75 @@ app.get('/api/stocks/watchlist', async (req: Request, res: Response) => {
     const quotes = await fetchWatchlistQuotes();
     const now = new Date();
     const todayKey = getDateKey(now, timeZone);
-    const { dateHeader, timeString } = formatDateTime(now.getTime(), timeZone);
+    const { timeString } = formatDateTime(now.getTime(), timeZone);
+    const marketStatus = getNseMarketStatus(now);
 
-    // Filter to meaningful moves (>= ±3%) to prevent noise or duplicate spam
+    // Filter to meaningful moves (>= ±3%) to prevent timeline clutter
     const meaningfulQuotes = quotes.filter((q) => q.meaningful);
 
     const activities: KairoActivity[] = meaningfulQuotes.map((q) => {
       const isGain = q.changePct >= 0;
       const sign = isGain ? '+' : '';
       const formattedChange = `${sign}${q.changePct.toFixed(1)}%`;
-      const title = isGain
-        ? `${q.name} gained ${formattedChange} today.`
-        : `${q.name} dropped ${formattedChange} today.`;
+      const absChange = `${Math.abs(q.changePct).toFixed(1)}%`;
+
+      let title = '';
+      let detail = '';
+
+      if (q.isMarketOpen) {
+        title = isGain
+          ? `${q.companyName} is up ${formattedChange} in today's active trading session.`
+          : `${q.companyName} is down ${absChange} in today's active trading session.`;
+        detail = `₹${q.price.toLocaleString()} · ${formattedChange} · NSE Live Trading`;
+      } else {
+        const sessionDate = q.marketSessionDate || 'recent';
+        title = `Last trading session (${sessionDate}): ${q.companyName} closed at ₹${q.price.toLocaleString()}, ${isGain ? 'up' : 'down'} ${absChange}.`;
+        detail = `₹${q.price.toLocaleString()} · ${formattedChange} · NSE (Session ended ${sessionDate} · ${marketStatus.statusText})`;
+      }
 
       return {
-        id: `stock_${q.symbol.replace('.', '_')}_${todayKey}`,
+        id: `stock_${q.ticker || q.symbol.replace('.', '_')}_${q.marketSessionDate || todayKey}`,
         source: 'stocks',
         activityType: 'stock_move',
         title,
-        detail: `₹${q.price.toLocaleString()} · ${formattedChange} · NSE Watchlist`,
+        detail,
         relatedEntityId: q.symbol,
-        occurredAt: now.getTime(),
+        occurredAt: q.verifiedAt || now.getTime(),
+        timestamp: q.verifiedAt || now.getTime(),
+        createdAt: now.getTime(),
         dateKey: todayKey,
         dateHeader: 'TODAY',
         timeString,
+        provenance: {
+          sourceName: 'NSE Market Provider',
+          verified: true,
+          recordTimestamp: q.verifiedAt || now.getTime(),
+          dataProvider: q.dataProvider || 'Yahoo Finance (Official NSE)',
+          marketSessionDate: q.marketSessionDate,
+          isMarketOpen: q.isMarketOpen,
+        },
         stockData: {
+          ticker: q.ticker,
+          exchange: q.exchange,
           symbol: q.symbol,
-          companyName: q.name,
+          companyName: q.companyName,
           price: q.price,
+          previousClose: q.previousClose,
           changePct: q.changePct,
           currency: q.currency,
+          marketSessionDate: q.marketSessionDate,
+          isMarketOpen: q.isMarketOpen,
+          sessionLabel: q.sessionLabel,
           dayHigh: q.dayHigh,
           dayLow: q.dayLow,
+          dataProvider: q.dataProvider,
         },
       };
     });
 
     return res.status(200).json({
       success: true,
+      marketStatus,
       quotes,
       meaningfulQuotes,
       activities,
@@ -1230,6 +1269,80 @@ app.get('/api/weekly-recap', async (req: Request, res: Response) => {
   }
 });
 
+// --- 9. BACKEND HEALTH & DIAGNOSTICS ENDPOINT (DEVELOPER ONLY) ---
+app.get('/api/health/diagnostics', async (_req: Request, res: Response) => {
+  try {
+    const now = new Date();
+    const marketStatus = getNseMarketStatus(now);
+    const quotes = await fetchWatchlistQuotes().catch(() => []);
+    const transactions = await fetchSpendIqRawTransactions().catch(() => []);
+
+    const appletConfig = (() => {
+      try {
+        const cfgRaw = fs.readFileSync(path.join(process.cwd(), 'firebase-applet-config.json'), 'utf-8');
+        const cfg = JSON.parse(cfgRaw);
+        return {
+          projectId: cfg.projectId,
+          authDomain: cfg.authDomain,
+          hasApiKey: Boolean(cfg.apiKey),
+          appId: cfg.appId,
+          authorizedDomainsTip: 'Ensure your deployment domain (e.g. *.vercel.app) is in Firebase Console > Authentication > Settings > Authorized domains.',
+        };
+      } catch {
+        return null;
+      }
+    })();
+
+    const diagnostics = {
+      status: 'healthy',
+      timestamp: now.toISOString(),
+      timestampMs: now.getTime(),
+      environment: process.env.NODE_ENV || 'development',
+      port: PORT,
+      firebase: appletConfig,
+      market: {
+        status: marketStatus,
+        monitoredStocks: WATCHLIST_REGISTRY.map((s) => s.companyName),
+        activeQuotes: quotes.map((q) => ({
+          ticker: q.ticker,
+          companyName: q.companyName,
+          price: q.price,
+          changePct: `${q.changePct}%`,
+          marketSessionDate: q.marketSessionDate,
+          isMarketOpen: q.isMarketOpen,
+          dataProvider: q.dataProvider,
+        })),
+      },
+      spendIq: {
+        totalLoaded: transactions.length,
+        cachedInStore: store.snapshots.cachedTransactions?.length || 0,
+        latestTx: transactions[0] ? {
+          id: transactions[0].id,
+          date: transactions[0].date,
+          merchant: transactions[0].merchant,
+          amountJpy: transactions[0].amountJpy,
+        } : null,
+      },
+      reminders: {
+        total: store.reminders.length,
+        active: store.reminders.filter((r) => r.status === 'active').length,
+        completed: store.reminders.filter((r) => r.status === 'completed').length,
+        items: store.reminders.map((r) => ({
+          id: r.id,
+          title: r.title,
+          status: r.status,
+          is_travel: r.is_travel,
+          flights_booked: r.flights_booked,
+        })),
+      },
+    };
+
+    return res.status(200).json(diagnostics);
+  } catch (err: any) {
+    return res.status(500).json({ status: 'error', error: err.message });
+  }
+});
+
 // Setup Vite middleware in dev or static serving in production
 async function startServer() {
   if (process.env.NODE_ENV === 'production') {
@@ -1245,9 +1358,14 @@ async function startServer() {
     app.use(vite.middlewares);
   }
 
-  app.listen(Number(PORT), '0.0.0.0', () => {
-    console.log(`Kairo backend server running on http://0.0.0.0:${PORT}`);
-  });
+  // Only start listening if not running in a serverless environment (e.g. Vercel)
+  if (!process.env.VERCEL) {
+    app.listen(Number(PORT), '0.0.0.0', () => {
+      console.log(`Kairo backend server running on http://0.0.0.0:${PORT}`);
+    });
+  }
 }
 
 startServer();
+
+export default app;

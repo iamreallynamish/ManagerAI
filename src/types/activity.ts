@@ -25,6 +25,8 @@ export interface KairoActivity {
   cardUsed?: string;
   relatedEntityId: string;
   occurredAt: number;              // Milliseconds timestamp (epoch UTC)
+  timestamp?: number;              // Canonical timestamp alias
+  createdAt?: number;              // Creation or sync timestamp
   endAt?: number;
   allDay?: boolean;
   link?: string;
@@ -33,6 +35,16 @@ export interface KairoActivity {
   timeString: string;              // E.g. "10:00 AM" or "All day"
   urgency?: 'today' | 'tomorrow' | 'soon' | 'later';
   
+  // Strict Provenance & Data Integrity
+  provenance?: {
+    sourceName: 'SpendIQ RTDB' | 'Google Calendar' | 'Google Classroom' | 'NSE Market Provider' | 'Kairo Backend Store';
+    verified: boolean;
+    recordTimestamp: number;
+    dataProvider?: string;
+    marketSessionDate?: string;
+    isMarketOpen?: boolean;
+  };
+
   // Smart grouping & changes
   isGrouped?: boolean;
   groupedCount?: number;
@@ -41,15 +53,22 @@ export interface KairoActivity {
   originalTime?: string;
   scheduleGapNote?: string;
 
-  // Stocks
+  // Verified Stocks
   stockData?: {
+    ticker?: string;
+    exchange?: string;
     symbol: string;
     companyName: string;
     price: number;
+    previousClose?: number;
     changePct: number;
     currency: string;
+    marketSessionDate?: string;
+    isMarketOpen?: boolean;
+    sessionLabel?: string;
     dayHigh?: number;
     dayLow?: number;
+    dataProvider?: string;
   };
 }
 
@@ -152,14 +171,25 @@ export interface UserState {
 }
 
 export interface StockQuote {
+  ticker?: string;
+  exchange?: 'NSE' | 'BSE';
   symbol: string;
   name: string;
+  companyName: string;
+  isin?: string;
   price: number;
+  previousClose?: number;
   changePct: number;
   currency: string;
+  marketSessionDate?: string;
+  isMarketOpen?: boolean;
+  marketStatusText?: string;
+  sessionLabel?: string;
   meaningful: boolean; // ±3% or more
   dayHigh?: number;
   dayLow?: number;
+  verifiedAt?: number;
+  dataProvider?: string;
 }
 
 export interface WeeklyRecapData {

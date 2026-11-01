@@ -10,10 +10,30 @@ import {
   User,
   signOut,
 } from 'firebase/auth';
-import firebaseConfig from '../../firebase-applet-config.json';
+import rawFirebaseConfig from '../../firebase-applet-config.json';
 
-const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+// Support Vercel and standard environment variable overrides while falling back to firebase-applet-config.json
+export const effectiveFirebaseConfig = {
+  apiKey: (typeof import.meta !== 'undefined' && import.meta.env?.VITE_FIREBASE_API_KEY) || rawFirebaseConfig.apiKey,
+  authDomain: (typeof import.meta !== 'undefined' && import.meta.env?.VITE_FIREBASE_AUTH_DOMAIN) || rawFirebaseConfig.authDomain,
+  projectId: (typeof import.meta !== 'undefined' && import.meta.env?.VITE_FIREBASE_PROJECT_ID) || rawFirebaseConfig.projectId,
+  storageBucket: (typeof import.meta !== 'undefined' && import.meta.env?.VITE_FIREBASE_STORAGE_BUCKET) || rawFirebaseConfig.storageBucket,
+  messagingSenderId: (typeof import.meta !== 'undefined' && import.meta.env?.VITE_FIREBASE_MESSAGING_SENDER_ID) || rawFirebaseConfig.messagingSenderId,
+  appId: (typeof import.meta !== 'undefined' && import.meta.env?.VITE_FIREBASE_APP_ID) || rawFirebaseConfig.appId,
+};
+
+const app = getApps().length > 0 ? getApp() : initializeApp(effectiveFirebaseConfig);
 export const auth = getAuth(app);
+
+export const getAuthDomainInfo = () => {
+  const currentHostname = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
+  return {
+    currentHostname,
+    authDomain: effectiveFirebaseConfig.authDomain,
+    projectId: effectiveFirebaseConfig.projectId,
+    isLocalhost: currentHostname === 'localhost' || currentHostname === '127.0.0.1',
+  };
+};
 
 const GOOGLE_TOKEN_STORAGE_KEY = 'kairo_google_access_token';
 
@@ -193,6 +213,15 @@ export const googleSignIn = async (): Promise<{ user: User; accessToken: string 
       error?.code === 'auth/cancelled-popup-request'
     ) {
       return null;
+    }
+    if (error?.code === 'auth/unauthorized-domain') {
+      const currentDomain = typeof window !== 'undefined' ? window.location.hostname : 'your deployment domain';
+      const friendlyMsg = `Firebase Auth: Domain "${currentDomain}" is not in the Authorized Domains list for project "${effectiveFirebaseConfig.projectId}". To fix: Open Firebase Console > Authentication > Settings > Authorized domains > Add "${currentDomain}".`;
+      console.error(friendlyMsg);
+      const customErr = new Error(friendlyMsg);
+      (customErr as any).code = 'auth/unauthorized-domain';
+      (customErr as any).domain = currentDomain;
+      throw customErr;
     }
     console.error('Google sign-in error:', error);
     throw error;
