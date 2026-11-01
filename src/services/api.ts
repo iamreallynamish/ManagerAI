@@ -27,6 +27,8 @@ export interface SpendIqFetchResult {
   };
 }
 
+const LOCAL_SPENDIQ_CACHE_KEY = 'kairo_cached_spendiq';
+
 export async function fetchSpendIqActivities(
   options: FetchTransactionsOptions = {}
 ): Promise<SpendIqFetchResult> {
@@ -35,19 +37,52 @@ export async function fetchSpendIqActivities(
   if (options.showAllSpenders !== undefined) params.set('showAllSpenders', String(options.showAllSpenders));
   if (options.spender) params.set('spender', options.spender);
   if (options.limitDays !== undefined) params.set('limitDays', String(options.limitDays));
-  else params.set('limitDays', '7');
+  else params.set('limitDays', '30');
 
-  const res = await fetch(`/api/spendiq/transactions?${params.toString()}`);
-  if (!res.ok) {
-    const errorData = await res.json().catch(() => ({}));
-    throw new Error(errorData.error || `HTTP ${res.status}: Failed to fetch Spend IQ transactions`);
+  try {
+    const res = await fetch(`/api/spendiq/transactions?${params.toString()}`);
+    if (!res.ok) {
+      const errorData = await res.json().catch(() => ({}));
+      throw new Error(errorData.error || `HTTP ${res.status}: Failed to fetch Spend IQ transactions`);
+    }
+
+    const data = await res.json();
+    const result: SpendIqFetchResult = {
+      activities: data.activities || [],
+      spendingContext: data.spendingContext,
+    };
+
+    if (result.activities.length > 0) {
+      try {
+        localStorage.setItem(LOCAL_SPENDIQ_CACHE_KEY, JSON.stringify(result));
+      } catch {}
+    }
+
+    return result;
+  } catch (err: any) {
+    console.warn('Network fetch for Spend IQ failed, checking client cache:', err.message);
+    try {
+      const cached = localStorage.getItem(LOCAL_SPENDIQ_CACHE_KEY);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (parsed && Array.isArray(parsed.activities) && parsed.activities.length > 0) {
+          return parsed;
+        }
+      }
+    } catch {}
+
+    // If no cache, return empty result gracefully rather than breaking the application view
+    return {
+      activities: [],
+      spendingContext: {
+        todaySpentJpy: 0,
+        todaySpentInr: 0,
+        todayTxCount: 0,
+        weekSpentJpy: 0,
+        weekSpentInr: 0,
+      },
+    };
   }
-
-  const data = await res.json();
-  return {
-    activities: data.activities || [],
-    spendingContext: data.spendingContext,
-  };
 }
 
 export interface SyncCalendarOptions {

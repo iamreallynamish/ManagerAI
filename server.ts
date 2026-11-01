@@ -35,6 +35,7 @@ interface KairoStore {
     calendarEvents: { [id: string]: { summary: string; startTime: string; lastSeen: number } };
     assignments: { [id: string]: { title: string; dueTimestamp: number; lastSeen: number } };
     txIds: string[];
+    cachedTransactions?: SpendIqRawTransaction[];
   };
 }
 
@@ -77,6 +78,7 @@ const DEFAULT_STORE: KairoStore = {
     calendarEvents: {},
     assignments: {},
     txIds: [],
+    cachedTransactions: [],
   },
 };
 
@@ -424,33 +426,53 @@ app.get('/api/stocks/watchlist', async (req: Request, res: Response) => {
 });
 
 // --- 4. SPEND IQ SERVICE WITH SMART GROUPING ---
+async function fetchSpendIqRawTransactions(): Promise<SpendIqRawTransaction[]> {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 6000);
+    const response = await fetch(SPEND_IQ_RTDB_URL, {
+      signal: controller.signal,
+      headers: { Accept: 'application/json' },
+    });
+    clearTimeout(timeoutId);
+
+    if (response.ok) {
+      const rawData = await response.json();
+      if (Array.isArray(rawData) && rawData.length > 0) {
+        store.snapshots.cachedTransactions = rawData;
+        saveStore();
+        return rawData;
+      }
+    } else {
+      console.warn(`Spend IQ RTDB returned HTTP ${response.status}`);
+    }
+  } catch (err: any) {
+    console.warn('Spend IQ RTDB fetch failed or timed out:', err.message);
+  }
+
+  // Gracefully fallback to persisted cached transactions in store
+  if (store.snapshots.cachedTransactions && store.snapshots.cachedTransactions.length > 0) {
+    return store.snapshots.cachedTransactions;
+  }
+
+  return [];
+}
+
 app.get('/api/spendiq/transactions', async (req: Request, res: Response) => {
   try {
     const timeZone = (req.query.timeZone as string) || 'Asia/Tokyo';
     const showAllSpenders = req.query.showAllSpenders !== 'false';
     const spenderFilter = req.query.spender as string | undefined;
-    const limitDays = req.query.limitDays !== undefined ? parseInt(req.query.limitDays as string, 10) : 7;
+    const limitDays = req.query.limitDays !== undefined ? parseInt(req.query.limitDays as string, 10) : 30;
 
-    const response = await fetch(SPEND_IQ_RTDB_URL);
-    if (!response.ok) {
-      throw new Error(`Spend IQ RTDB returned HTTP ${response.status}`);
-    }
-
-    const rawData = await response.json();
-    if (!Array.isArray(rawData)) {
-      return res.status(200).json({ success: true, activities: [], count: 0 });
-    }
-
-    const transactions: SpendIqRawTransaction[] = rawData;
+    const transactions = await fetchSpendIqRawTransactions();
 
     const now = new Date();
     const todayKey = getDateKey(now, timeZone);
-    const yesterdayDate = new Date(now.getTime() - 86400000);
-    const yesterdayKey = getDateKey(yesterdayDate, timeZone);
-    const sevenDaysAgoDate = new Date(now.getTime() - limitDays * 86400000);
-    const sevenDaysAgoKey = getDateKey(sevenDaysAgoDate, timeZone);
+    const cutoffDate = new Date(now.getTime() - (limitDays > 0 ? limitDays : 30) * 86400000);
+    const cutoffDateKey = getDateKey(cutoffDate, timeZone);
 
-    // Filter by spender and date window
+    // Filter by spender and date window (allowing past limitDays, never dropping recent due to minor TZ offset)
     const filteredTxs = transactions.filter((tx) => {
       if (!tx || !tx.id) return false;
       if (spenderFilter) return tx.spender === spenderFilter;
@@ -458,7 +480,7 @@ app.get('/api/spendiq/transactions', async (req: Request, res: Response) => {
 
       if (limitDays > 0 && tx.timestampMs) {
         const txDateKey = getDateKey(new Date(tx.timestampMs), timeZone);
-        if (txDateKey < sevenDaysAgoKey || txDateKey > todayKey) {
+        if (txDateKey < cutoffDateKey) {
           return false;
         }
       }
@@ -608,7 +630,7 @@ app.get('/api/spendiq/transactions', async (req: Request, res: Response) => {
       },
       window: {
         todayKey,
-        sevenDaysAgoKey,
+        cutoffDateKey,
         limitDays,
         timeZone,
       },
@@ -1108,24 +1130,19 @@ app.get('/api/user/since-last-checked', async (req: Request, res: Response) => {
 
     // 2. Check SpendIQ transactions since lastChecked
     try {
-      const spendResp = await fetch(SPEND_IQ_RTDB_URL);
-      if (spendResp.ok) {
-        const rawTxs: SpendIqRawTransaction[] = await spendResp.json();
-        if (Array.isArray(rawTxs)) {
-          const newTxs = rawTxs.filter((t) => t.timestampMs && t.timestampMs > lastChecked);
-          if (newTxs.length > 0) {
-            let totalJpy = 0;
-            for (const t of newTxs) totalJpy += t.amountJpy || 0;
-            const topMerchant = newTxs[0].merchant || 'Merchant';
-            items.push({
-              id: `slc_spend_${newTxs.length}`,
-              source: 'spend_iq',
-              title: `${newTxs.length} new transaction${newTxs.length > 1 ? 's' : ''} in SpendIQ`,
-              subtitle: `Total ¥${totalJpy.toLocaleString()} · Recent: ${topMerchant}`,
-              timestamp: newTxs[0].timestampMs || Date.now(),
-            });
-          }
-        }
+      const rawTxs = await fetchSpendIqRawTransactions();
+      const newTxs = rawTxs.filter((t) => t.timestampMs && t.timestampMs > lastChecked);
+      if (newTxs.length > 0) {
+        let totalJpy = 0;
+        for (const t of newTxs) totalJpy += t.amountJpy || 0;
+        const topMerchant = newTxs[0].merchant || 'Merchant';
+        items.push({
+          id: `slc_spend_${newTxs.length}`,
+          source: 'spend_iq',
+          title: `${newTxs.length} new transaction${newTxs.length > 1 ? 's' : ''} in SpendIQ`,
+          subtitle: `Total ¥${totalJpy.toLocaleString()} · Recent: ${topMerchant}`,
+          timestamp: newTxs[0].timestampMs || Date.now(),
+        });
       }
     } catch (err) {
       console.warn('SpendIQ check in since-last-checked error:', err);
@@ -1170,17 +1187,12 @@ app.get('/api/weekly-recap', async (req: Request, res: Response) => {
     let transactionCount = 0;
 
     try {
-      const resp = await fetch(SPEND_IQ_RTDB_URL);
-      if (resp.ok) {
-        const rawTxs: SpendIqRawTransaction[] = await resp.json();
-        if (Array.isArray(rawTxs)) {
-          for (const tx of rawTxs) {
-            if (tx.timestampMs && tx.timestampMs >= sevenDaysAgoMs) {
-              transactionCount++;
-              totalSpendingJpy += tx.amountJpy || 0;
-              totalSpendingInr += tx.amountInr || 0;
-            }
-          }
+      const rawTxs = await fetchSpendIqRawTransactions();
+      for (const tx of rawTxs) {
+        if (tx.timestampMs && tx.timestampMs >= sevenDaysAgoMs) {
+          transactionCount++;
+          totalSpendingJpy += tx.amountJpy || 0;
+          totalSpendingInr += tx.amountInr || 0;
         }
       }
     } catch {}

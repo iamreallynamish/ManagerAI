@@ -32,6 +32,9 @@ import {
 import {
   initAuth,
   googleSignIn,
+  githubSignIn,
+  disconnectGoogle,
+  disconnectGithub,
   logout,
   getAccessToken,
 } from './services/auth';
@@ -113,8 +116,7 @@ export default function App() {
       }
       return data.activities;
     } catch (err: any) {
-      console.error('Failed to load Spend IQ:', err);
-      setErrorMessage(err.message || 'Failed to load Spend IQ transactions');
+      console.warn('Spend IQ fetch notice:', err);
       return [];
     }
   }, []);
@@ -285,7 +287,7 @@ export default function App() {
     showAllSpenders,
   ]);
 
-  // Connect Google Account
+  // Connect Google Account (supports linking with existing GitHub session)
   const handleConnectGoogle = async () => {
     try {
       setIsSyncing(true);
@@ -308,12 +310,53 @@ export default function App() {
         err?.code !== 'auth/popup-closed-by-user' &&
         err?.code !== 'auth/cancelled-popup-request'
       ) {
-        console.error('Sign-in failed:', err);
+        console.error('Google sign-in failed:', err);
         setErrorMessage(err.message || 'Google sign-in could not be completed.');
       }
     } finally {
       setIsSyncing(false);
     }
+  };
+
+  // Connect GitHub Account (supports linking with Google session)
+  const handleConnectGitHub = async () => {
+    try {
+      setIsSyncing(true);
+      setErrorMessage(null);
+      const res = await githubSignIn();
+      if (res && res.user) {
+        setUser(res.user);
+        if (res.user?.displayName && !localStorage.getItem('kairo_preferred_name')) {
+          const firstName = res.user.displayName.split(' ')[0];
+          if (firstName) setPreferredName(firstName);
+        }
+        await loadRemindersData(res.user.uid);
+      }
+    } catch (err: any) {
+      if (
+        err?.code !== 'auth/popup-closed-by-user' &&
+        err?.code !== 'auth/cancelled-popup-request'
+      ) {
+        console.error('GitHub sign-in failed:', err);
+        setErrorMessage(err.message || 'GitHub sign-in could not be completed.');
+      }
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  const handleDisconnectGoogle = async () => {
+    const updatedUser = await disconnectGoogle();
+    setUser(updatedUser);
+    setHasGoogleToken(false);
+    setCalendarActivities([]);
+    setClassroomActivities([]);
+    setClassroomAssignments([]);
+  };
+
+  const handleDisconnectGitHub = async () => {
+    const updatedUser = await disconnectGithub();
+    setUser(updatedUser);
   };
 
   const handleSignOut = async () => {
@@ -575,6 +618,9 @@ export default function App() {
         showAllSpenders={showAllSpenders}
         onToggleShowAllSpenders={setShowAllSpenders}
         onConnectCalendar={handleConnectGoogle}
+        onConnectGitHub={handleConnectGitHub}
+        onDisconnectGoogle={handleDisconnectGoogle}
+        onDisconnectGitHub={handleDisconnectGitHub}
         onSignOut={handleSignOut}
         onOpenReminders={() => setIsRemindersOpen(true)}
         onOpenWeeklyRecap={() => setIsWeeklyRecapOpen(true)}

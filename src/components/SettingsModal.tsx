@@ -6,14 +6,17 @@ import {
   Calendar,
   LogOut,
   CheckCircle2,
+  AlertCircle,
   BookmarkCheck,
   User as UserIcon,
   RefreshCw,
   BarChart3,
   TrendingUp,
+  Github,
 } from 'lucide-react';
 import { User } from 'firebase/auth';
 import { triggerHaptic } from '../utils/haptics';
+import { getLinkedProviders } from '../services/auth';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -32,6 +35,9 @@ interface SettingsModalProps {
   onUpdatePreferredName: (name: string) => void;
   onManualRefresh: () => void;
   isSyncing: boolean;
+  onConnectGitHub?: () => void;
+  onDisconnectGoogle?: () => void;
+  onDisconnectGitHub?: () => void;
 }
 
 const COMMON_TIMEZONES = [
@@ -60,7 +66,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onUpdatePreferredName,
   onManualRefresh,
   isSyncing,
+  onConnectGitHub,
+  onDisconnectGoogle,
+  onDisconnectGitHub,
 }) => {
+  const linked = getLinkedProviders(user);
+  const isGoogleActive =
+    (linked.isGoogleLinked || (user?.email && user.email.includes('@gmail.com'))) &&
+    hasCalendarToken;
+
   const handleDismiss = () => {
     triggerHaptic('light');
     onClose();
@@ -275,49 +289,104 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
               </div>
 
-              {/* Section 7: Google Account Connection */}
-              <div className="bg-neutral-100/70 dark:bg-neutral-900/60 rounded-2xl p-3.5 border border-black/[0.03] dark:border-white/[0.05]">
-                <div className="flex items-center gap-2 mb-2 text-[13px] font-semibold text-neutral-700 dark:text-neutral-300">
-                  <Calendar className="w-4 h-4 text-blue-600 dark:text-blue-400" />
-                  <span>Google Calendar & Classroom</span>
+              {/* Section 7: Connected Accounts (Google & GitHub) */}
+              <div className="bg-neutral-100/70 dark:bg-neutral-900/60 rounded-2xl p-3.5 border border-black/[0.03] dark:border-white/[0.05] space-y-3">
+                <div className="text-[13px] font-semibold text-neutral-700 dark:text-neutral-300">
+                  Connected Accounts
                 </div>
-                {user ? (
-                  <div className="p-3 bg-white dark:bg-[#2C2C2E] rounded-xl border border-black/[0.04] dark:border-white/[0.06]">
-                    <div className="flex items-center justify-between">
-                      <div className="min-w-0">
-                        <div className="flex items-center gap-1.5 text-[13px] font-medium text-neutral-900 dark:text-neutral-100 truncate">
-                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
-                          <span className="truncate">{user.email}</span>
-                        </div>
-                        <div className="text-[11px] text-neutral-500 dark:text-neutral-400 mt-0.5">
-                          {hasCalendarToken ? 'Calendar & Classroom Active' : 'Token Expired — Reconnect'}
-                        </div>
+
+                {/* Google Calendar & Classroom */}
+                <div className="p-3 bg-white dark:bg-[#2C2C2E] rounded-xl border border-black/[0.04] dark:border-white/[0.06]">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="min-w-0 pr-2">
+                      <div className="flex items-center gap-2">
+                        <Calendar className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" />
+                        <span className="text-[13px] font-semibold text-neutral-900 dark:text-neutral-100">
+                          Google Calendar & Classroom
+                        </span>
                       </div>
+                      <div className="mt-1 flex items-center gap-1.5 text-[12px] text-neutral-600 dark:text-neutral-400 truncate">
+                        {isGoogleActive ? (
+                          <>
+                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
+                            <span className="truncate">{linked.googleEmail || user?.email || 'Connected'} · Active</span>
+                          </>
+                        ) : linked.isGoogleLinked || user ? (
+                          <>
+                            <AlertCircle className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+                            <span className="text-amber-600 dark:text-amber-400">Token expired — reconnect for schedule</span>
+                          </>
+                        ) : (
+                          <span>Sync today & tomorrow's classes and assignments</span>
+                        )}
+                      </div>
+                    </div>
+
+                    {isGoogleActive ? (
                       <button
-                        onClick={onSignOut}
-                        className="min-h-[36px] px-3 flex items-center gap-1.5 text-[12px] font-medium text-red-600 dark:text-red-400 hover:bg-red-500/10 rounded-lg active:scale-95 transition-all ml-2 shrink-0 cursor-pointer"
+                        onClick={onDisconnectGoogle || onSignOut}
+                        className="min-h-[34px] px-3 flex items-center gap-1 text-[12px] font-medium text-red-600 dark:text-red-400 hover:bg-red-500/10 rounded-lg active:scale-95 transition-all shrink-0 cursor-pointer"
                       >
                         <LogOut className="w-3.5 h-3.5" />
                         <span>Disconnect</span>
                       </button>
+                    ) : (
+                      <button
+                        onClick={() => {
+                          handleDismiss();
+                          onConnectCalendar();
+                        }}
+                        className="min-h-[34px] px-3.5 text-[12px] font-semibold bg-blue-600 hover:bg-blue-700 active:scale-95 text-white rounded-xl transition-all cursor-pointer shadow-xs shrink-0"
+                      >
+                        {linked.isGoogleLinked || user ? 'Reconnect' : 'Connect'}
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* GitHub Account */}
+                <div className="p-3 bg-white dark:bg-[#2C2C2E] rounded-xl border border-black/[0.04] dark:border-white/[0.06]">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="min-w-0 pr-2">
+                      <div className="flex items-center gap-2">
+                        <Github className="w-4 h-4 text-neutral-800 dark:text-neutral-200 shrink-0" />
+                        <span className="text-[13px] font-semibold text-neutral-900 dark:text-neutral-100">
+                          GitHub
+                        </span>
+                      </div>
+                      <div className="mt-1 flex items-center gap-1.5 text-[12px] text-neutral-600 dark:text-neutral-400 truncate">
+                        {linked.isGithubLinked ? (
+                          <>
+                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
+                            <span className="truncate">{linked.githubUsername || linked.githubEmail || 'GitHub Connected'}</span>
+                          </>
+                        ) : (
+                          <span>Connect GitHub to link your identity</span>
+                        )}
+                      </div>
                     </div>
+
+                    {linked.isGithubLinked ? (
+                      <button
+                        onClick={onDisconnectGitHub || onSignOut}
+                        className="min-h-[34px] px-3 flex items-center gap-1 text-[12px] font-medium text-red-600 dark:text-red-400 hover:bg-red-500/10 rounded-lg active:scale-95 transition-all shrink-0 cursor-pointer"
+                      >
+                        <LogOut className="w-3.5 h-3.5" />
+                        <span>Disconnect</span>
+                      </button>
+                    ) : onConnectGitHub ? (
+                      <button
+                        onClick={() => {
+                          handleDismiss();
+                          onConnectGitHub();
+                        }}
+                        className="min-h-[34px] px-3.5 text-[12px] font-semibold bg-neutral-900 dark:bg-neutral-100 hover:bg-neutral-800 dark:hover:bg-neutral-200 text-white dark:text-neutral-900 active:scale-95 rounded-xl transition-all cursor-pointer shadow-xs shrink-0"
+                      >
+                        Connect
+                      </button>
+                    ) : null}
                   </div>
-                ) : (
-                  <div className="p-3 bg-white dark:bg-[#2C2C2E] rounded-xl border border-black/[0.04] dark:border-white/[0.06] flex items-center justify-between">
-                    <span className="text-[13px] text-neutral-600 dark:text-neutral-300">
-                      Not connected
-                    </span>
-                    <button
-                      onClick={() => {
-                        handleDismiss();
-                        onConnectCalendar();
-                      }}
-                      className="min-h-[38px] px-4 text-[13px] font-semibold bg-blue-600 hover:bg-blue-700 active:scale-95 text-white rounded-xl transition-all cursor-pointer shadow-xs"
-                    >
-                      Connect Google
-                    </button>
-                  </div>
-                )}
+                </div>
               </div>
 
               {/* Section 8: Manual Refresh */}
