@@ -207,3 +207,20 @@ export interface UserPreferences {
   showAllSpenders: boolean;
   preferredName?: string;
 }
+
+export interface PortfolioHolding {
+  companyName: string;
+  ticker: string;
+  shares: number;
+  averagePurchasePrice: number;
+  totalInvested: number;
+  currency: 'INR';
+  exchange: 'NSE' | 'BSE' | 'Unlisted';
+  dataProviderSymbol?: string;
+  isin?: string;
+  verifiedCompanyIdentity: string;
+  currentPrice?: number;
+  currentValue?: number;
+  unrealizedPnl?: number;
+  unrealizedPnlPct?: number;
+}

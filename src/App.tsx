@@ -6,7 +6,6 @@ import { UpNext } from './components/UpNext';
 import { DailyBriefing } from './components/DailyBriefing';
 import { SinceLastChecked } from './components/SinceLastChecked';
 import { NeedsAttention } from './components/NeedsAttention';
-import { FilterBar, FilterValue } from './components/FilterBar';
 import { DateSection } from './components/DateSection';
 import { EmptyState } from './components/EmptyState';
 import { SettingsModal } from './components/SettingsModal';
@@ -50,7 +49,6 @@ import { synthesizeBriefing } from './services/briefingEngine';
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [hasGoogleToken, setHasGoogleToken] = useState(false);
-  const [currentFilter, setCurrentFilter] = useState<FilterValue>('all');
 
   // Multi-source activities
   const [spendActivities, setSpendActivities] = useState<KairoActivity[]>([]);
@@ -478,21 +476,11 @@ export default function App() {
     );
   }, [spendActivities, calendarActivities, classroomActivities, stockActivities]);
 
-  // 3. Filter activities
-  const filteredActivities = useMemo(() => {
-    if (currentFilter === 'all') return allActivities;
-    if (currentFilter === 'spend_iq') return spendActivities;
-    if (currentFilter === 'calendar') return calendarActivities;
-    if (currentFilter === 'classroom') return classroomActivities;
-    if (currentFilter === 'stocks') return stockActivities;
-    return allActivities;
-  }, [currentFilter, allActivities, spendActivities, calendarActivities, classroomActivities, stockActivities]);
-
-  // 4. Group activities by dateHeader, prioritized: TOMORROW (preview) -> TODAY -> YESTERDAY -> Historical
+  // 3. Group all activities by dateHeader, prioritized: TOMORROW (preview) -> TODAY -> YESTERDAY -> Historical
   const groupedSections = useMemo(() => {
     const groupMap = new Map<string, { dateHeader: string; activities: KairoActivity[] }>();
 
-    for (const act of filteredActivities) {
+    for (const act of allActivities) {
       if (!groupMap.has(act.dateHeader)) {
         groupMap.set(act.dateHeader, { dateHeader: act.dateHeader, activities: [] });
       }
@@ -514,24 +502,7 @@ export default function App() {
     });
 
     return sections;
-  }, [filteredActivities]);
-
-  // Filter counts
-  const counts = useMemo(() => {
-    return {
-      all: allActivities.length,
-      spend_iq: spendActivities.length,
-      calendar: calendarActivities.length,
-      classroom: classroomActivities.length,
-      stocks: stockActivities.length,
-    };
-  }, [
-    allActivities.length,
-    spendActivities.length,
-    calendarActivities.length,
-    classroomActivities.length,
-    stockActivities.length,
-  ]);
+  }, [allActivities]);
 
   return (
     <div className="min-h-screen bg-[#F2F2F7] dark:bg-black text-neutral-900 dark:text-neutral-100 flex flex-col font-sans antialiased selection:bg-neutral-200 dark:selection:bg-neutral-800">
@@ -558,13 +529,6 @@ export default function App() {
         items={briefing.attentionItems}
         onCompleteReminder={(id) => handleToggleReminder(id, true)}
         onConfirmFlights={handleConfirmFlightsAction}
-      />
-
-      {/* 5. Segmented Filter Bar (iOS Segmented Control) */}
-      <FilterBar
-        currentFilter={currentFilter}
-        onSelectFilter={setCurrentFilter}
-        counts={counts}
       />
 
       {/* Optional error banner */}
@@ -612,9 +576,8 @@ export default function App() {
               Gathering your awareness feed…
             </p>
           </div>
-        ) : filteredActivities.length === 0 ? (
+        ) : allActivities.length === 0 ? (
           <EmptyState
-            filter={currentFilter}
             onConnectCalendar={handleConnectGoogle}
             isCalendarConnected={hasGoogleToken}
           />

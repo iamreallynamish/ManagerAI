@@ -6,9 +6,12 @@ import {
   StockQuote,
   SinceLastCheckedItem,
   WeeklyRecapData,
+  PortfolioHolding,
 } from '../src/types/activity.js';
 import {
   WATCHLIST_REGISTRY,
+  USER_PORTFOLIO_HOLDINGS,
+  TOTAL_PORTFOLIO_COST_BASIS,
   getNseMarketStatus,
   validateMarketQuote,
 } from '../src/services/stockService.js';
@@ -35,9 +38,9 @@ const KAIRO_RTDB_STORE_URL =
 
 // Build and runtime metadata
 const BUILD_METADATA = {
-  buildId: 'kairo-prod-2026.11.02-parity-fix',
-  gitCommit: 'a89c2f10-backend-parity',
-  deploymentTimestamp: '2026-11-02T08:30:00Z',
+  buildId: 'kairo-prod-2026.11.02-portfolio-update',
+  gitCommit: 'b94e311a-production-refinement',
+  deploymentTimestamp: '2026-11-02T13:00:00Z',
   environment: process.env.VERCEL ? 'vercel-production' : (process.env.NODE_ENV || 'development'),
   runtime: process.env.VERCEL ? 'vercel-serverless-node' : 'node-express',
 };
@@ -48,6 +51,11 @@ export interface KairoStore {
       last_checked_at: number;
       updated_at: number;
     };
+  };
+  portfolio: {
+    holdings: PortfolioHolding[];
+    totalCostBasis: number;
+    updatedAt: number;
   };
   reminders: PersonalReminder[];
   snapshots: {
@@ -68,6 +76,11 @@ const DEFAULT_STORE: KairoStore = {
       last_checked_at: Date.now() - 2 * 60 * 60 * 1000,
       updated_at: Date.now(),
     },
+  },
+  portfolio: {
+    holdings: USER_PORTFOLIO_HOLDINGS,
+    totalCostBasis: TOTAL_PORTFOLIO_COST_BASIS,
+    updatedAt: Date.now(),
   },
   reminders: [
     {
@@ -127,6 +140,7 @@ async function getStore(): Promise<KairoStore> {
           ...DEFAULT_STORE,
           ...cloudData,
           userState: { ...DEFAULT_STORE.userState, ...(cloudData.userState || {}) },
+          portfolio: cloudData.portfolio?.holdings?.length ? cloudData.portfolio : DEFAULT_STORE.portfolio,
           reminders: Array.isArray(cloudData.reminders)
             ? cloudData.reminders
             : Object.values(cloudData.reminders || {}),
@@ -547,16 +561,42 @@ app.get('/api/stocks/watchlist', async (req: Request, res: Response) => {
       };
     });
 
+    const store = await getStore();
+    const portfolio = store.portfolio || DEFAULT_STORE.portfolio;
+
     return res.status(200).json({
       success: true,
       marketStatus,
       quotes,
       meaningfulQuotes,
       activities,
+      portfolio: {
+        holdings: portfolio.holdings,
+        totalCostBasis: portfolio.totalCostBasis,
+        updatedAt: portfolio.updatedAt,
+      },
     });
   } catch (error: any) {
     console.error('Error fetching stock watchlist:', error);
     return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// User Persistent Portfolio Holdings Endpoint
+app.get('/api/portfolio', async (_req: Request, res: Response) => {
+  try {
+    const store = await getStore();
+    const portfolio = store.portfolio || DEFAULT_STORE.portfolio;
+    return res.status(200).json({
+      success: true,
+      holdings: portfolio.holdings,
+      totalCostBasis: portfolio.totalCostBasis,
+      currency: 'INR',
+      count: portfolio.holdings.length,
+      updatedAt: portfolio.updatedAt,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -822,7 +862,7 @@ app.post('/api/calendar/sync', async (req: Request, res: Response) => {
     const tomorrowKey = getDateKey(tomorrowDate, timeZone);
 
     const timeMin = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
-    const timeMax = new Date(now.getTime() + 60 * 60 * 60 * 1000).toISOString();
+    const timeMax = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString();
 
     const calendarUrl = `https://www.googleapis.com/calendar/v3/calendars/primary/events?singleEvents=true&orderBy=startTime&timeMin=${encodeURIComponent(
       timeMin
@@ -846,6 +886,7 @@ app.post('/api/calendar/sync', async (req: Request, res: Response) => {
 
     const todayItems: any[] = [];
     const tomorrowItems: any[] = [];
+    const futureItems: any[] = [];
     const seenEventIds = new Set<string>();
 
     for (const item of items) {
@@ -863,6 +904,8 @@ app.post('/api/calendar/sync', async (req: Request, res: Response) => {
         todayItems.push(item);
       } else if (eventDateKey === tomorrowKey) {
         tomorrowItems.push(item);
+      } else if (eventDate.getTime() > tomorrowDate.getTime()) {
+        futureItems.push(item);
       }
     }
 
@@ -873,6 +916,12 @@ app.post('/api/calendar/sync', async (req: Request, res: Response) => {
     });
 
     tomorrowItems.sort((a, b) => {
+      const ta = new Date(a.start?.dateTime || a.start?.date).getTime();
+      const tb = new Date(b.start?.dateTime || b.start?.date).getTime();
+      return ta - tb;
+    });
+
+    futureItems.sort((a, b) => {
       const ta = new Date(a.start?.dateTime || a.start?.date).getTime();
       const tb = new Date(b.start?.dateTime || b.start?.date).getTime();
       return ta - tb;
@@ -1088,6 +1137,40 @@ app.post('/api/calendar/sync', async (req: Request, res: Response) => {
       }
     }
 
+    for (const item of futureItems) {
+        const startTimeStr = item.start?.dateTime || item.start?.date;
+        const isAllDay = !item.start?.dateTime;
+        const occurredAt = new Date(startTimeStr).getTime();
+        const endAt = item.end?.dateTime || item.end?.date ? new Date(item.end?.dateTime || item.end?.date).getTime() : undefined;
+        const { dateKey, dateHeader, timeString } = formatDateTime(occurredAt, timeZone);
+        const summary = item.summary || 'Scheduled appointment';
+        const diffDays = Math.max(2, Math.ceil((occurredAt - now.getTime()) / 86400000));
+
+        const detailParts = [];
+        if (item.location) detailParts.push(item.location);
+        if (item.hangoutLink) detailParts.push('Google Meet');
+
+        const title = isAllDay
+          ? `${summary} (All day)`
+          : `${summary} at ${timeString}`;
+
+        activities.push({
+          id: `cal_${item.id}`,
+          source: 'calendar',
+          activityType: 'calendar_event',
+          title: `In ${diffDays} days: ${title}`,
+          detail: detailParts.length > 0 ? detailParts.join(' · ') : undefined,
+          relatedEntityId: item.id,
+          occurredAt,
+          endAt,
+          allDay: isAllDay,
+          link: item.htmlLink,
+          dateKey,
+          dateHeader,
+          timeString: isAllDay ? 'All day' : timeString,
+        });
+      }
+
     persistStore({ snapshots: store.snapshots }).catch(() => {});
 
     return res.status(200).json({
@@ -1274,13 +1357,14 @@ app.get('/api/user/since-last-checked', async (req: Request, res: Response) => {
       if (q.meaningful) {
         const isGain = q.changePct >= 0;
         const sign = isGain ? '+' : '-';
+        const direction = isGain ? 'up' : 'down';
         items.push({
           id: `slc_stock_${q.symbol}`,
           source: 'stocks',
-          title: `${q.name} moved ${sign}${Math.abs(q.changePct).toFixed(1)}%`,
+          title: `Since you last checked, ${q.companyName || q.name} moved ${direction} ${Math.abs(q.changePct).toFixed(1)}% on NSE.`,
           subtitle: q.isMarketOpen
-            ? `Trading at ₹${q.price.toLocaleString('en-IN', { minimumFractionDigits: 2 })} on NSE`
-            : `Closed at ₹${q.price.toLocaleString('en-IN', { minimumFractionDigits: 2 })} on NSE · Market closed`,
+            ? `Currently trading at ₹${q.price.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`
+            : `Last closed at ₹${q.price.toLocaleString('en-IN', { minimumFractionDigits: 2 })} · Market closed`,
           timestamp: Date.now(),
         });
       }
@@ -1294,11 +1378,15 @@ app.get('/api/user/since-last-checked', async (req: Request, res: Response) => {
         let totalJpy = 0;
         for (const t of newTxs) totalJpy += t.amountJpy || 0;
         const topMerchant = newTxs[0].merchant || 'Merchant';
+        const title =
+          newTxs.length === 1
+            ? `While you were away, a purchase at ${topMerchant} was recorded in Spend IQ.`
+            : `While you were away, ${newTxs.length} purchases totaling ¥${totalJpy.toLocaleString()} were recorded.`;
         items.push({
           id: `slc_spend_${newTxs.length}`,
           source: 'spend_iq',
-          title: `${newTxs.length} new transaction${newTxs.length > 1 ? 's' : ''} in SpendIQ`,
-          subtitle: `Total ¥${totalJpy.toLocaleString()} · Recent: ${topMerchant}`,
+          title,
+          subtitle: `Recent: ${topMerchant} · Spend IQ ledger`,
           timestamp: newTxs[0].timestampMs || Date.now(),
         });
       }
@@ -1306,7 +1394,7 @@ app.get('/api/user/since-last-checked', async (req: Request, res: Response) => {
       console.warn('SpendIQ check in since-last-checked error:', err);
     }
 
-    // 3. Updated active reminders
+    // 3. Updated active reminders or travel plans
     const updatedReminders = store.reminders.filter(
       (r) => r.updated_at > lastChecked && r.status === 'active'
     );
@@ -1314,7 +1402,7 @@ app.get('/api/user/since-last-checked', async (req: Request, res: Response) => {
       items.push({
         id: `slc_rem_${rem.id}`,
         source: 'reminder',
-        title: `Reminder active: ${rem.title}`,
+        title: `Your upcoming reminder '${rem.title}' is approaching.`,
         subtitle: rem.details || rem.context,
         timestamp: rem.updated_at,
       });

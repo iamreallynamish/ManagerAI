@@ -13,14 +13,16 @@ import {
   BarChart3,
   TrendingUp,
   Github,
-  Activity,
+  Mail,
+  Plus,
   Server,
-  Database,
+  Building2,
   ShieldCheck,
 } from 'lucide-react';
 import { User } from 'firebase/auth';
 import { triggerHaptic } from '../utils/haptics';
 import { getLinkedProviders } from '../services/auth';
+import { USER_PORTFOLIO_HOLDINGS, TOTAL_PORTFOLIO_COST_BASIS } from '../services/stockService';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -247,24 +249,55 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </button>
               </div>
 
-              {/* Section 4: Stock Watchlist Details */}
+              {/* Section 4: Verified Portfolio & Watchlist */}
               <div className="bg-neutral-100/70 dark:bg-neutral-900/60 rounded-2xl p-3.5 border border-black/[0.03] dark:border-white/[0.05]">
-                <div className="flex items-center gap-2 mb-1.5 text-[13px] font-semibold text-neutral-700 dark:text-neutral-300">
-                  <TrendingUp className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
-                  <span>Monitored Stock Watchlist</span>
+                <div className="flex items-center justify-between gap-2 mb-1.5">
+                  <div className="flex items-center gap-2 text-[13px] font-semibold text-neutral-900 dark:text-neutral-100">
+                    <TrendingUp className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+                    <span>Investment Portfolio</span>
+                  </div>
+                  <span className="text-[12px] font-bold text-neutral-900 dark:text-neutral-100 font-mono">
+                    ₹{TOTAL_PORTFOLIO_COST_BASIS.toLocaleString('en-IN', { minimumFractionDigits: 2 })} Cost Basis
+                  </span>
                 </div>
-                <p className="text-[12px] text-neutral-500 dark:text-neutral-400 mb-2">
-                  Only surfaces updates when price moves ±3% or more in a day:
+                <p className="text-[12px] text-neutral-500 dark:text-neutral-400 mb-2.5">
+                  Stored persistently across 5 verified holdings. Share counts and purchase prices are never overwritten:
                 </p>
-                <div className="flex flex-wrap gap-1.5 text-[11px]">
-                  {['Jio Financial', 'Persistent Systems', 'L&T', 'Tata Consumer', 'Apollo Hospitals'].map((stock) => (
-                    <span
-                      key={stock}
-                      className="px-2 py-0.5 rounded-md bg-white dark:bg-[#2C2C2E] border border-black/[0.05] dark:border-white/[0.05] text-neutral-700 dark:text-neutral-300 font-medium"
+
+                <div className="space-y-1.5">
+                  {USER_PORTFOLIO_HOLDINGS.map((h) => (
+                    <div
+                      key={h.companyName}
+                      className="p-2.5 rounded-xl bg-white dark:bg-[#2C2C2E] border border-black/[0.04] dark:border-white/[0.06] flex items-center justify-between text-[12px]"
                     >
-                      {stock}
-                    </span>
+                      <div>
+                        <div className="font-semibold text-neutral-900 dark:text-neutral-100 flex items-center gap-1.5">
+                          <span>{h.companyName}</span>
+                          <span className="text-[10px] px-1.5 py-0.2 rounded-sm bg-neutral-100 dark:bg-neutral-800 text-neutral-500 dark:text-neutral-400 font-mono">
+                            {h.exchange}
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-neutral-500 dark:text-neutral-400 mt-0.5">
+                          {h.shares} {h.shares === 1 ? 'share' : 'shares'} @ ₹{h.averagePurchasePrice.toLocaleString('en-IN', { minimumFractionDigits: 2 })}
+                        </div>
+                      </div>
+                      <div className="text-right">
+                        <div className="font-mono font-semibold text-neutral-900 dark:text-neutral-100">
+                          ₹{h.totalInvested.toLocaleString('en-IN', { minimumFractionDigits: 2 })}
+                        </div>
+                        <div className="text-[10px] text-emerald-600 dark:text-emerald-400">
+                          Verified holding
+                        </div>
+                      </div>
+                    </div>
                   ))}
+                </div>
+
+                <div className="mt-2.5 p-2 rounded-xl bg-blue-500/[0.06] dark:bg-blue-500/[0.12] border border-blue-500/15 text-[11px] text-blue-900 dark:text-blue-200">
+                  <div className="font-medium flex items-center gap-1.5">
+                    <ShieldCheck className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400 shrink-0" />
+                    <span>Company Verification: Apollo Micro Systems (INE713T01028) strictly distinguished from Apollo Hospitals.</span>
+                  </div>
                 </div>
               </div>
 
@@ -323,13 +356,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
               </div>
 
-              {/* Section 7: Connected Accounts (Google & GitHub) */}
+              {/* Section 7: Connected Accounts (Multi-Account Support) */}
               <div className="bg-neutral-100/70 dark:bg-neutral-900/60 rounded-2xl p-3.5 border border-black/[0.03] dark:border-white/[0.05] space-y-3">
-                <div className="text-[13px] font-semibold text-neutral-700 dark:text-neutral-300">
-                  Connected Accounts
+                <div className="flex items-center justify-between">
+                  <div className="text-[13px] font-semibold text-neutral-700 dark:text-neutral-300">
+                    Connected Accounts
+                  </div>
+                  <span className="text-[11px] text-neutral-500 dark:text-neutral-400">
+                    Multi-Account Sync
+                  </span>
                 </div>
 
-                {/* Google Calendar & Classroom */}
+                {/* Primary Google Calendar & Classroom */}
                 <div className="p-3 bg-white dark:bg-[#2C2C2E] rounded-xl border border-black/[0.04] dark:border-white/[0.06]">
                   <div className="flex items-center justify-between gap-2">
                     <div className="min-w-0 pr-2">
@@ -351,7 +389,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             <span className="text-amber-600 dark:text-amber-400">Token expired — reconnect for schedule</span>
                           </>
                         ) : (
-                          <span>Sync today & tomorrow's classes and assignments</span>
+                          <span>Sync today & upcoming classes and assignments</span>
                         )}
                       </div>
                     </div>
@@ -375,6 +413,34 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         {hasEverLinkedGoogle ? 'Reconnect' : 'Connect'}
                       </button>
                     )}
+                  </div>
+                </div>
+
+                {/* Additional Gmail Accounts connection action */}
+                <div className="p-3 bg-white dark:bg-[#2C2C2E] rounded-xl border border-black/[0.04] dark:border-white/[0.06]">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="min-w-0 pr-2">
+                      <div className="flex items-center gap-2">
+                        <Mail className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                        <span className="text-[13px] font-semibold text-neutral-900 dark:text-neutral-100">
+                          Additional Gmail Accounts
+                        </span>
+                      </div>
+                      <div className="mt-1 text-[12px] text-neutral-500 dark:text-neutral-400">
+                        Connect university or secondary Gmail accounts independently
+                      </div>
+                    </div>
+
+                    <button
+                      onClick={() => {
+                        handleDismiss();
+                        onConnectCalendar();
+                      }}
+                      className="min-h-[34px] px-3 flex items-center gap-1 text-[12px] font-semibold bg-neutral-100 dark:bg-neutral-800 hover:bg-neutral-200 dark:hover:bg-neutral-700 text-neutral-800 dark:text-neutral-200 rounded-xl active:scale-95 transition-all shrink-0 cursor-pointer"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      <span>Add Account</span>
+                    </button>
                   </div>
                 </div>
 
@@ -421,7 +487,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     ) : null}
                   </div>
                 </div>
+
+                <p className="text-[11px] text-neutral-500 dark:text-neutral-400 leading-normal pt-0.5">
+                  Email Intelligence: Aggregates notices across connected inboxes. Strictly prioritizes verified university announcements, course deadlines, travel confirmations, and financial alerts. Routine marketing emails and newsletters are excluded.
+                </p>
               </div>
+
 
               {/* Section 8: Manual Refresh */}
               <div className="bg-neutral-100/70 dark:bg-neutral-900/60 rounded-2xl p-3.5 border border-black/[0.03] dark:border-white/[0.05] flex items-center justify-between">

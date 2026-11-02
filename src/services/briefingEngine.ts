@@ -11,6 +11,36 @@ export interface BriefingResult {
   sentences: string[];
   attentionItems: AttentionItem[];
   upNext: UpNextItem | null;
+  scheduleClear: boolean;
+}
+
+function cleanCalendarTitle(raw: string): string {
+  if (!raw) return 'Scheduled commitment';
+  return raw
+    .replace(/^(Your next class is\s*|Your next event is\s*|You have\s*|Tomorrow, you have\s*|Tomorrow at [^:]+:\s*|In \d+ days:\s*)/i, '')
+    .replace(/\s+at\s+\d{1,2}:\d{2}\s*[AP]M(\s+today)?\.?/i, '')
+    .replace(/\(All day\)/i, '')
+    .trim();
+}
+
+function formatRelativeTiming(targetMs: number, timeZone: string, timeString?: string): string {
+  const now = new Date();
+  const diffMs = targetMs - now.getTime();
+  const diffDays = Math.ceil(diffMs / 86400000);
+
+  const targetDate = new Date(targetMs);
+  const weekday = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'long' }).format(targetDate);
+  const monthDay = new Intl.DateTimeFormat('en-US', { timeZone, month: 'short', day: 'numeric' }).format(targetDate);
+
+  if (diffDays <= 0) {
+    return timeString ? `Today at ${timeString}` : 'Today';
+  } else if (diffDays === 1) {
+    return timeString ? `Tomorrow at ${timeString}` : 'Tomorrow';
+  } else if (diffDays <= 6) {
+    return timeString ? `In ${diffDays} days (${weekday}) at ${timeString}` : `In ${diffDays} days (${weekday})`;
+  } else {
+    return timeString ? `In ${diffDays} days on ${monthDay} at ${timeString}` : `In ${diffDays} days on ${monthDay}`;
+  }
 }
 
 export function synthesizeBriefing(options: {
@@ -61,7 +91,11 @@ export function synthesizeBriefing(options: {
 
   const greeting = `${timeGreeting}, ${userName}.`;
 
-  // 2. Classify calendar events
+  // 2. Filter genuinely future calendar events
+  const futureCalendarEvents = calendarActivities
+    .filter((act) => act.activityType === 'calendar_event' && act.occurredAt > nowMs)
+    .sort((a, b) => a.occurredAt - b.occurredAt);
+
   const todayEvents = calendarActivities
     .filter((act) => act.dateHeader === 'TODAY' && act.activityType === 'calendar_event')
     .sort((a, b) => a.occurredAt - b.occurredAt);
@@ -70,93 +104,86 @@ export function synthesizeBriefing(options: {
     .filter((act) => act.dateHeader === 'TOMORROW' && act.activityType === 'calendar_event')
     .sort((a, b) => a.occurredAt - b.occurredAt);
 
-  const upcomingToday = todayEvents.filter((e) => e.occurredAt > nowMs);
   const pastToday = todayEvents.filter((e) => e.occurredAt <= nowMs);
 
-  // 3. Classify assignments
-  const activeAssignments = [...assignments].sort(
-    (a, b) => (a.dueTimestampMs || 0) - (b.dueTimestampMs || 0)
-  );
-  const dueTodayAssignments = activeAssignments.filter((a) => a.urgency === 'today');
-  const dueTomorrowAssignments = activeAssignments.filter((a) => a.urgency === 'tomorrow');
-  const dueSoonAssignments = activeAssignments.filter((a) => a.urgency === 'soon');
+  // 3. Filter genuinely future assignments
+  const futureAssignments = [...assignments]
+    .filter((a) => (a.dueTimestampMs || 0) > nowMs)
+    .sort((a, b) => (a.dueTimestampMs || 0) - (b.dueTimestampMs || 0));
+
+  const dueTodayAssignments = assignments.filter((a) => a.urgency === 'today');
+  const dueTomorrowAssignments = assignments.filter((a) => a.urgency === 'tomorrow');
 
   // 4. Active personal reminders & Travel context
   const activeReminders = reminders.filter((r) => r.status === 'active' || (!r.completed && r.status !== 'dismissed'));
   const travelTrip = reminders.find((r) => r.is_travel || r.title.toLowerCase().includes('flight') || r.title.toLowerCase().includes('india'));
 
-  // 5. Intelligent Up Next Selection (Strictly 1 primary item)
+  // 5. Intelligent "Up Next" Selection across all horizons
   let upNext: UpNextItem | null = null;
 
-  // Criterion A: Is an event happening later today?
-  if (upcomingToday.length > 0) {
-    const nextEvent = upcomingToday[0];
-    const isClass = nextEvent.title.toLowerCase().includes('lecture') || nextEvent.title.toLowerCase().includes('class');
-    const cleanTitle = nextEvent.title
-      .replace(/^Your next class is\s*/i, '')
-      .replace(/^Your next event is\s*/i, '')
-      .replace(/^You have\s*/i, '')
-      .replace(/at\s+\d+:\d+\s+[AP]M\s+today\.?/i, '')
-      .trim();
+  const nextCal = futureCalendarEvents[0];
+  const nextAssn = futureAssignments[0];
+
+  // Compare earliest future calendar event vs earliest future assignment
+  if (nextCal && nextAssn) {
+    if (nextCal.occurredAt <= (nextAssn.dueTimestampMs || Infinity)) {
+      const isClass = nextCal.title.toLowerCase().includes('lecture') || nextCal.title.toLowerCase().includes('class');
+      const cleanTitle = cleanCalendarTitle(nextCal.title);
+      const timing = formatRelativeTiming(nextCal.occurredAt, timeZone, nextCal.timeString);
+      const diffDays = Math.ceil((nextCal.occurredAt - nowMs) / 86400000);
+
+      upNext = {
+        id: `upnext_${nextCal.id}`,
+        category: isClass ? 'class' : 'event',
+        headline: cleanTitle,
+        contextTime: timing,
+        detail: nextCal.detail,
+        urgency: diffDays === 0 ? 'now' : diffDays === 1 ? 'tomorrow' : 'soon',
+        link: nextCal.link,
+      };
+    } else {
+      const timing = formatRelativeTiming(nextAssn.dueTimestampMs || nowMs, timeZone, nextAssn.dueTimeString);
+      const diffDays = Math.ceil(((nextAssn.dueTimestampMs || nowMs) - nowMs) / 86400000);
+
+      upNext = {
+        id: `upnext_assn_${nextAssn.id}`,
+        category: 'assignment',
+        headline: `${nextAssn.courseName} · ${nextAssn.title}`,
+        contextTime: `Deadline: ${timing}`,
+        detail: 'Academic course deadline',
+        urgency: diffDays === 0 ? 'today' : diffDays === 1 ? 'tomorrow' : 'soon',
+        link: nextAssn.alternateLink,
+      };
+    }
+  } else if (nextCal) {
+    const isClass = nextCal.title.toLowerCase().includes('lecture') || nextCal.title.toLowerCase().includes('class');
+    const cleanTitle = cleanCalendarTitle(nextCal.title);
+    const timing = formatRelativeTiming(nextCal.occurredAt, timeZone, nextCal.timeString);
+    const diffDays = Math.ceil((nextCal.occurredAt - nowMs) / 86400000);
 
     upNext = {
-      id: `upnext_${nextEvent.id}`,
+      id: `upnext_${nextCal.id}`,
       category: isClass ? 'class' : 'event',
-      headline: cleanTitle || 'Upcoming Commitment',
-      contextTime: `Today at ${nextEvent.timeString}`,
-      detail: nextEvent.detail,
-      urgency: 'now',
-      link: nextEvent.link,
+      headline: cleanTitle,
+      contextTime: timing,
+      detail: nextCal.detail,
+      urgency: diffDays === 0 ? 'now' : diffDays === 1 ? 'tomorrow' : 'soon',
+      link: nextCal.link,
     };
-  }
-  // Criterion B: Is an assignment due today?
-  else if (dueTodayAssignments.length > 0) {
-    const topDue = dueTodayAssignments[0];
-    upNext = {
-      id: `upnext_due_${topDue.id}`,
-      category: 'assignment',
-      headline: `${topDue.courseName} · ${topDue.title}`,
-      contextTime: `Due today at ${topDue.dueTimeString}`,
-      detail: 'Academic deadline today',
-      urgency: 'today',
-      link: topDue.alternateLink,
-    };
-  }
-  // Criterion C: Tomorrow's first class or event
-  else if (tomorrowEvents.length > 0) {
-    const firstTom = tomorrowEvents[0];
-    const isClass = firstTom.title.toLowerCase().includes('lecture') || firstTom.title.toLowerCase().includes('class');
-    const cleanTitle = firstTom.title
-      .replace(/^Tomorrow at \d+:\d+\s+[AP]M:\s*/i, '')
-      .replace(/^Tomorrow, you have\s*/i, '')
-      .replace(/at\s+\d+:\d+\s+[AP]M\.?/i, '')
-      .trim();
+  } else if (nextAssn) {
+    const timing = formatRelativeTiming(nextAssn.dueTimestampMs || nowMs, timeZone, nextAssn.dueTimeString);
+    const diffDays = Math.ceil(((nextAssn.dueTimestampMs || nowMs) - nowMs) / 86400000);
 
     upNext = {
-      id: `upnext_${firstTom.id}`,
-      category: isClass ? 'class' : 'event',
-      headline: cleanTitle || 'Tomorrow\'s Event',
-      contextTime: `Tomorrow at ${firstTom.timeString}`,
-      detail: firstTom.detail,
-      urgency: 'tomorrow',
-      link: firstTom.link,
-    };
-  }
-  // Criterion D: Assignment due tomorrow
-  else if (dueTomorrowAssignments.length > 0) {
-    const tomDue = dueTomorrowAssignments[0];
-    upNext = {
-      id: `upnext_due_tom_${tomDue.id}`,
+      id: `upnext_assn_${nextAssn.id}`,
       category: 'assignment',
-      headline: `${tomDue.courseName} · ${tomDue.title}`,
-      contextTime: `Due tomorrow at ${tomDue.dueTimeString}`,
-      detail: 'Academic deadline tomorrow',
-      urgency: 'tomorrow',
-      link: tomDue.alternateLink,
+      headline: `${nextAssn.courseName} · ${nextAssn.title}`,
+      contextTime: `Deadline: ${timing}`,
+      detail: 'Academic course deadline',
+      urgency: diffDays === 0 ? 'today' : diffDays === 1 ? 'tomorrow' : 'soon',
+      link: nextAssn.alternateLink,
     };
-  }
-  // Criterion E: Travel or active high-priority reminder
-  else if (travelTrip && !travelTrip.flights_booked) {
+  } else if (travelTrip && !travelTrip.flights_booked) {
     upNext = {
       id: `upnext_travel_${travelTrip.id}`,
       category: 'travel',
@@ -177,42 +204,65 @@ export function synthesizeBriefing(options: {
     };
   }
 
-  // 6. Synthesize Concise 2–3 Sentences Daily Briefing
+  // 6. Dynamic Personal Opening Summary
   const sentences: string[] = [];
   const attentionItems: AttentionItem[] = [];
+  const scheduleClear = futureCalendarEvents.length === 0 && futureAssignments.length === 0;
 
-  // Sentence 1: Today's status & Schedule context
+  // Sentence 1: Today's status or the next genuine commitment
   if (hour >= 17) {
     // Evening tone
     if (todayEvents.length > 0 && pastToday.length === todayEvents.length) {
       sentences.push("You're all done with scheduled commitments for today.");
-    } else if (upcomingToday.length > 0) {
-      sentences.push(`You have one last event today: ${upcomingToday[0].timeString}.`);
+    } else if (todayEvents.length > 0 && futureCalendarEvents.some((e) => e.dateHeader === 'TODAY')) {
+      const nextOne = futureCalendarEvents.find((e) => e.dateHeader === 'TODAY')!;
+      sentences.push(`You have one last event today: ${cleanCalendarTitle(nextOne.title)} at ${nextOne.timeString}.`);
+    } else if (futureCalendarEvents.length > 0) {
+      const nextEv = futureCalendarEvents[0];
+      const timing = formatRelativeTiming(nextEv.occurredAt, timeZone, nextEv.timeString);
+      sentences.push(`Your next scheduled commitment is ${cleanCalendarTitle(nextEv.title)}, ${timing}.`);
+    } else if (futureAssignments.length > 0) {
+      const nextAs = futureAssignments[0];
+      const timing = formatRelativeTiming(nextAs.dueTimestampMs || nowMs, timeZone, nextAs.dueTimeString);
+      sentences.push(`Your next academic deadline is ${nextAs.courseName} (${nextAs.title}), ${timing}.`);
     } else {
-      sentences.push("You have a quiet evening ahead with no remaining meetings.");
+      sentences.push("Your schedule is completely clear for the coming days.");
     }
   } else {
-    // Morning / Afternoon tone
-    if (todayEvents.length === 0) {
-      sentences.push("You have no classes or meetings scheduled for today.");
-    } else if (upcomingToday.length > 0) {
+    // Daytime tone
+    const upcomingToday = todayEvents.filter((e) => e.occurredAt > nowMs);
+    if (upcomingToday.length > 0) {
       const nextOne = upcomingToday[0];
       const isClass = nextOne.title.toLowerCase().includes('lecture') || nextOne.title.toLowerCase().includes('class');
-      const eventWord = isClass ? 'class' : 'event';
+      const eventWord = isClass ? 'class' : 'commitment';
       sentences.push(
-        `You have ${todayEvents.length} scheduled ${todayEvents.length === 1 ? eventWord : eventWord + 'es'} today, with your next at ${nextOne.timeString}.`
+        `You have ${upcomingToday.length} scheduled ${upcomingToday.length === 1 ? eventWord : eventWord + 's'} remaining today, next at ${nextOne.timeString}.`
       );
+    } else if (todayEvents.length > 0) {
+      sentences.push(`You completed all ${todayEvents.length} scheduled commitments for today.`);
+    } else if (tomorrowEvents.length > 0) {
+      const firstTom = tomorrowEvents[0];
+      sentences.push(
+        `Your schedule is open today; your next event is tomorrow at ${firstTom.timeString} (${cleanCalendarTitle(firstTom.title)}).`
+      );
+    } else if (futureCalendarEvents.length > 0) {
+      const nextEv = futureCalendarEvents[0];
+      const timing = formatRelativeTiming(nextEv.occurredAt, timeZone, nextEv.timeString);
+      sentences.push(`You have no events today. Your next commitment is ${cleanCalendarTitle(nextEv.title)}, ${timing}.`);
+    } else if (futureAssignments.length > 0) {
+      const nextAs = futureAssignments[0];
+      const timing = formatRelativeTiming(nextAs.dueTimestampMs || nowMs, timeZone, nextAs.dueTimeString);
+      sentences.push(`Your schedule is open today. Your next deadline is ${nextAs.courseName} (${nextAs.title}), ${timing}.`);
     } else {
-      sentences.push(`You completed all ${todayEvents.length} commitments for today.`);
+      sentences.push("Your schedule is completely clear with no upcoming appointments or classes.");
     }
 
-    // Schedule gap context if notable
     if (scheduleGapNote) {
       sentences.push(scheduleGapNote);
     }
   }
 
-  // Sentence 2: Academic assignments
+  // Sentence 2: Deadlines & Assignments
   if (dueTodayAssignments.length > 0) {
     const top = dueTodayAssignments[0];
     sentences.push(`Your ${top.courseName} assignment is due today at ${top.dueTimeString}.`);
@@ -237,21 +287,14 @@ export function synthesizeBriefing(options: {
       link: top.alternateLink,
       actionType: 'open_link',
     });
-  } else if (dueSoonAssignments.length > 0) {
-    const top = dueSoonAssignments[0];
+  } else if (futureAssignments.length > 0) {
+    const top = futureAssignments[0];
     const diffDays = Math.max(1, Math.ceil(((top.dueTimestampMs || 0) - nowMs) / 86400000));
-    sentences.push(`Your ${top.courseName} assignment is due in ${diffDays} days.`);
+    sentences.push(`Your next assignment (${top.courseName}) is due in ${diffDays} days.`);
   }
 
-  // Sentence 3: Tomorrow's preview or Travel preparation
-  if (tomorrowEvents.length > 0) {
-    const firstTom = tomorrowEvents[0];
-    const isClass = firstTom.title.toLowerCase().includes('lecture') || firstTom.title.toLowerCase().includes('class');
-    const label = isClass ? 'classes' : 'events';
-    sentences.push(
-      `Tomorrow, you have ${tomorrowEvents.length} ${tomorrowEvents.length === 1 ? (isClass ? 'class' : 'event') : label} starting at ${firstTom.timeString}.`
-    );
-  } else if (travelTrip && !travelTrip.flights_booked) {
+  // Sentence 3: Life admin, travel, or portfolio summary
+  if (travelTrip && !travelTrip.flights_booked) {
     sentences.push("You planned to book your India flights during the 2nd–3rd week of November.");
     attentionItems.push({
       id: `att_trip_${travelTrip.id}`,
@@ -263,7 +306,7 @@ export function synthesizeBriefing(options: {
       actionType: 'confirm_flights',
     });
   } else if (travelTrip && travelTrip.flights_booked) {
-    sentences.push("India flights are booked for Jan 5 – Apr 5.");
+    sentences.push("India flights are confirmed for Jan 5 – Apr 5.");
     attentionItems.push({
       id: `att_trip_prep_${travelTrip.id}`,
       type: 'travel_prep',
@@ -273,11 +316,25 @@ export function synthesizeBriefing(options: {
       actionId: travelTrip.id,
       actionType: 'complete_reminder',
     });
+  } else if (activeReminders.length > 0) {
+    const rem = activeReminders[0];
+    sentences.push(`Reminder active: ${rem.title}.`);
+    attentionItems.push({
+      id: `att_rem_${rem.id}`,
+      type: 'reminder_active',
+      title: rem.title,
+      subtitle: rem.details || rem.context,
+      urgency: rem.priority === 'high' ? 'high' : 'medium',
+      actionId: rem.id,
+      actionType: 'complete_reminder',
+    });
+  } else {
+    sentences.push("Your investment portfolio of 5 holdings stands steady at ₹45,310.11 cost basis.");
   }
 
-  // Add any non-travel active reminders to attentionItems if space permits
+  // Fill attention items up to 3
   for (const rem of activeReminders) {
-    if (rem.id !== travelTrip?.id && attentionItems.length < 3) {
+    if (rem.id !== travelTrip?.id && !attentionItems.some((a) => a.actionId === rem.id) && attentionItems.length < 3) {
       attentionItems.push({
         id: `att_rem_${rem.id}`,
         type: 'reminder_active',
@@ -290,7 +347,6 @@ export function synthesizeBriefing(options: {
     }
   }
 
-  // Keep briefing strictly to 2–3 sentences for clarity
   const finalSentences = sentences.slice(0, 3);
 
   return {
@@ -298,5 +354,6 @@ export function synthesizeBriefing(options: {
     sentences: finalSentences,
     attentionItems,
     upNext,
+    scheduleClear,
   };
 }

@@ -131,6 +131,33 @@ export const TimelineItem: React.FC<TimelineItemProps> = ({ activity, isLast }) 
             <div className="flex items-center gap-1.5 flex-wrap">
               <span>{activity.title}</span>
 
+              {/* Subtle Source Badge */}
+              {!isSummary && !isEmptyCalendar && (
+                <span
+                  className={`inline-flex items-center text-[10px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded-md select-none ${
+                    isSpend
+                      ? 'text-emerald-700 dark:text-emerald-300 bg-emerald-500/10'
+                      : isCalendar
+                      ? 'text-blue-700 dark:text-blue-300 bg-blue-500/10'
+                      : isClassroom
+                      ? 'text-amber-700 dark:text-amber-300 bg-amber-500/10'
+                      : isStock
+                      ? 'text-indigo-700 dark:text-indigo-300 bg-indigo-500/10'
+                      : 'text-purple-700 dark:text-purple-300 bg-purple-500/10'
+                  }`}
+                >
+                  {isSpend
+                    ? 'Spend IQ'
+                    : isCalendar
+                    ? 'Calendar'
+                    : isClassroom
+                    ? 'Classroom'
+                    : isStock
+                    ? 'Stocks'
+                    : 'Reminder'}
+                </span>
+              )}
+
               {/* Rescheduled badge */}
               {activity.isRescheduled && (
                 <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold bg-amber-500/15 text-amber-700 dark:text-amber-300">

@@ -1,9 +1,99 @@
 /**
- * Verified Stock Watchlist & Market Status Service
+ * Verified Stock Watchlist & Portfolio Service
  * 
- * Strict Source of Truth: Real exchange market data only.
- * No hardcoded movements, no guessed prices, no loose company matches.
+ * Strict Source of Truth: Real exchange market data and persistent user portfolio holdings.
+ * No hardcoded fake movements, no guessed prices, no loose company matches.
+ * 
+ * Portfolio assets (Total Cost Basis: ₹45,310.11):
+ * - Tata Capital: 46 shares @ ₹326.00 (Total ₹14,996.00)
+ * - Persistent Systems: 2 shares @ ₹5,455.80 (Total ₹10,911.60)
+ * - Larsen & Toubro: 1 share @ ₹3,977.01 (Total ₹3,977.01)
+ * - Jio Platforms: 12 shares @ ₹1,119.00 (Total ₹13,428.00)
+ * - Apollo Micro Systems: 5 shares @ ₹399.50 (Total ₹1,997.50)
+ * 
+ * Company Identity Rule: Apollo Micro Systems (APOLLO.NS, ISIN INE713T01028) must never
+ * be confused with Apollo Hospitals (APOLLOHOSP.NS).
  */
+
+export interface PortfolioHolding {
+  companyName: string;
+  ticker: string;
+  shares: number;
+  averagePurchasePrice: number;
+  totalInvested: number;
+  currency: 'INR';
+  exchange: 'NSE' | 'BSE' | 'Unlisted';
+  dataProviderSymbol?: string;
+  isin?: string;
+  verifiedCompanyIdentity: string;
+  currentPrice?: number;
+  currentValue?: number;
+  unrealizedPnl?: number;
+  unrealizedPnlPct?: number;
+}
+
+export const USER_PORTFOLIO_HOLDINGS: PortfolioHolding[] = [
+  {
+    companyName: 'Tata Capital',
+    ticker: 'TATACAPITAL',
+    shares: 46,
+    averagePurchasePrice: 326.00,
+    totalInvested: 14996.00,
+    currency: 'INR',
+    exchange: 'BSE',
+    dataProviderSymbol: 'TATACAP.BO',
+    verifiedCompanyIdentity: 'Tata Capital Limited (Financial Services)',
+  },
+  {
+    companyName: 'Persistent Systems',
+    ticker: 'PERSISTENT',
+    shares: 2,
+    averagePurchasePrice: 5455.80,
+    totalInvested: 10911.60,
+    currency: 'INR',
+    exchange: 'NSE',
+    dataProviderSymbol: 'PERSISTENT.NS',
+    isin: 'INE262H01013',
+    verifiedCompanyIdentity: 'Persistent Systems Limited',
+  },
+  {
+    companyName: 'Larsen & Toubro',
+    ticker: 'LT',
+    shares: 1,
+    averagePurchasePrice: 3977.01,
+    totalInvested: 3977.01,
+    currency: 'INR',
+    exchange: 'NSE',
+    dataProviderSymbol: 'LT.NS',
+    isin: 'INE018A01030',
+    verifiedCompanyIdentity: 'Larsen & Toubro Limited',
+  },
+  {
+    companyName: 'Jio Platforms',
+    ticker: 'JIOPLATFORMS',
+    shares: 12,
+    averagePurchasePrice: 1119.00,
+    totalInvested: 13428.00,
+    currency: 'INR',
+    exchange: 'Unlisted',
+    dataProviderSymbol: 'JIOFIN.NS', // Proxy market benchmark for digital financial services
+    verifiedCompanyIdentity: 'Jio Platforms Limited',
+  },
+  {
+    companyName: 'Apollo Micro Systems',
+    ticker: 'APOLLO',
+    shares: 5,
+    averagePurchasePrice: 399.50,
+    totalInvested: 1997.50,
+    currency: 'INR',
+    exchange: 'NSE',
+    dataProviderSymbol: 'APOLLO.NS',
+    isin: 'INE713T01028',
+    verifiedCompanyIdentity: 'Apollo Micro Systems Limited (Defense & Aerospace Electronics - NOT Apollo Hospitals)',
+  },
+];
+
+export const TOTAL_PORTFOLIO_COST_BASIS = 45310.11;
 
 export interface WatchlistStockIdentity {
   ticker: string;                // e.g. 'APOLLO'
@@ -17,7 +107,7 @@ export interface WatchlistStockIdentity {
 }
 
 /**
- * Permanent structured watchlist identities.
+ * Permanent structured watchlist identities matching the user's holdings.
  * Apollo Micro Systems Limited (APOLLO.NS) is explicitly distinguished from Apollo Hospitals (APOLLOHOSP.NS).
  */
 export const WATCHLIST_REGISTRY: WatchlistStockIdentity[] = [
@@ -27,16 +117,6 @@ export const WATCHLIST_REGISTRY: WatchlistStockIdentity[] = [
     companyName: 'Apollo Micro Systems Limited',
     dataProviderSymbol: 'APOLLO.NS',
     isin: 'INE713T01028',
-    market: 'India',
-    currency: 'INR',
-    significanceThresholdPct: 3.0,
-  },
-  {
-    ticker: 'JIOFIN',
-    exchange: 'NSE',
-    companyName: 'Jio Financial Services Limited',
-    dataProviderSymbol: 'JIOFIN.NS',
-    isin: 'INE758E01017',
     market: 'India',
     currency: 'INR',
     significanceThresholdPct: 3.0,
@@ -62,11 +142,11 @@ export const WATCHLIST_REGISTRY: WatchlistStockIdentity[] = [
     significanceThresholdPct: 3.0,
   },
   {
-    ticker: 'TATACONSUM',
+    ticker: 'JIOFIN',
     exchange: 'NSE',
-    companyName: 'Tata Consumer Products Limited',
-    dataProviderSymbol: 'TATACONSUM.NS',
-    isin: 'INE192A01025',
+    companyName: 'Jio Platforms (via Jio Financial)',
+    dataProviderSymbol: 'JIOFIN.NS',
+    isin: 'INE758E01017',
     market: 'India',
     currency: 'INR',
     significanceThresholdPct: 3.0,
@@ -185,6 +265,7 @@ export interface ValidationPipelineResult {
 /**
  * Validates raw market response against structured identity and checks freshness.
  * If ticker or identity does not match, rejects the data immediately.
+ * Explicitly guards against confusion between Apollo Micro Systems and Apollo Hospitals.
  */
 export function validateMarketQuote(
   stock: WatchlistStockIdentity,
@@ -196,7 +277,17 @@ export function validateMarketQuote(
     return { valid: false, reason: `Missing market symbol for ${stock.ticker}` };
   }
 
-  if (rawMeta.symbol.toUpperCase() !== stock.dataProviderSymbol.toUpperCase()) {
+  const cleanSymbol = rawMeta.symbol.toUpperCase();
+
+  // Guard against Apollo Hospitals confusion
+  if (stock.ticker === 'APOLLO' && (cleanSymbol.includes('APOLLOHOSP') || cleanSymbol === 'APOLLOHOSP.NS')) {
+    return {
+      valid: false,
+      reason: 'Rejected: Apollo Hospitals (APOLLOHOSP.NS) is NOT Apollo Micro Systems (APOLLO.NS).',
+    };
+  }
+
+  if (cleanSymbol !== stock.dataProviderSymbol.toUpperCase()) {
     return {
       valid: false,
       reason: `Symbol mismatch: expected ${stock.dataProviderSymbol}, got ${rawMeta.symbol}`,
@@ -257,7 +348,7 @@ export function validateMarketQuote(
     dayHigh: rawMeta.regularMarketDayHigh,
     dayLow: rawMeta.regularMarketDayLow,
     verifiedAt: now.getTime(),
-    dataProvider: 'Yahoo Finance (Official NSE)',
+    dataProvider: 'Yahoo Finance (Official NSE/BSE)',
   };
 
   return { valid: true, quote };

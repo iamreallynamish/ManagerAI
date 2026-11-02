@@ -9,6 +9,7 @@ import {
   PersonalReminder,
   UserState,
   ReminderStatus,
+  PortfolioHolding,
 } from '../types/activity';
 
 export interface FetchTransactionsOptions {
@@ -322,6 +323,26 @@ export async function fetchStockWatchlist(
   } catch (err) {
     console.warn('Error fetching stock watchlist:', err);
     return { quotes: [], activities: [] };
+  }
+}
+
+// --- Persistent User Portfolio ---
+export async function fetchPortfolio(): Promise<{
+  holdings: PortfolioHolding[];
+  totalCostBasis: number;
+  count: number;
+}> {
+  try {
+    const res = await fetch('/api/portfolio');
+    if (!res.ok) return { holdings: [], totalCostBasis: 45310.11, count: 0 };
+    const data = await res.json();
+    return {
+      holdings: data.holdings || [],
+      totalCostBasis: data.totalCostBasis || 45310.11,
+      count: data.count || 0,
+    };
+  } catch {
+    return { holdings: [], totalCostBasis: 45310.11, count: 0 };
   }
 }
 
