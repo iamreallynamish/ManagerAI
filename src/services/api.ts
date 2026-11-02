@@ -1,5 +1,7 @@
+import spendiqFallback from '../data/spendiq_fallback.json';
 import {
   KairoActivity,
+  SpendIqRawTransaction,
   ClassroomAssignment,
   StockQuote,
   SinceLastCheckedItem,
@@ -28,6 +30,134 @@ export interface SpendIqFetchResult {
 }
 
 const LOCAL_SPENDIQ_CACHE_KEY = 'kairo_cached_spendiq';
+const DIRECT_RTDB_URL =
+  'https://spendiq-7de3d-default-rtdb.asia-southeast1.firebasedatabase.app/spendiq_family_ledger/transactions.json';
+
+function formatRawTransactionsToSpendIqResult(
+  rawList: SpendIqRawTransaction[],
+  options: FetchTransactionsOptions
+): SpendIqFetchResult {
+  const timeZone = options.timeZone || 'Asia/Tokyo';
+  const showAllSpenders = options.showAllSpenders !== false;
+  const spenderFilter = options.spender;
+
+  let filtered = rawList.filter((tx) => {
+    if (!tx || !tx.id) return false;
+    if (spenderFilter) return tx.spender === spenderFilter;
+    if (!showAllSpenders) return tx.spender === 'Son';
+    return true;
+  });
+
+  if (filtered.length === 0 && rawList.length > 0) {
+    filtered = rawList.slice(0, 30);
+  }
+
+  let todaySpentJpy = 0;
+  let todaySpentInr = 0;
+  let todayTxCount = 0;
+  let weekSpentJpy = 0;
+  let weekSpentInr = 0;
+
+  const groupMap = new Map<string, SpendIqRawTransaction[]>();
+  for (const tx of filtered) {
+    if (tx.amountJpy) weekSpentJpy += tx.amountJpy;
+    if (tx.amountInr) weekSpentInr += tx.amountInr;
+
+    const d = tx.timestampMs ? new Date(tx.timestampMs) : new Date();
+    const dateKey = d.toISOString().split('T')[0];
+    const merchantClean = (tx.merchant || 'General').trim().toLowerCase();
+    const groupKey = `${dateKey}__${merchantClean}__${tx.spender || 'All'}`;
+    if (!groupMap.has(groupKey)) groupMap.set(groupKey, []);
+    groupMap.get(groupKey)!.push(tx);
+  }
+
+  const activities: KairoActivity[] = [];
+  groupMap.forEach((txList) => {
+    txList.sort((a, b) => (b.timestampMs || 0) - (a.timestampMs || 0));
+    const primary = txList[0];
+    const occurredAt = primary.timestampMs || Date.now();
+    const d = new Date(occurredAt);
+    const dateKey = d.toISOString().split('T')[0];
+    const dateHeader = d
+      .toLocaleDateString('en-US', { timeZone, month: 'short', day: 'numeric', year: 'numeric' })
+      .toUpperCase();
+    const timeString = d.toLocaleTimeString('en-US', {
+      timeZone,
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+    });
+
+    if (txList.length > 1) {
+      let totalJpy = 0;
+      let totalInr = 0;
+      for (const t of txList) {
+        totalJpy += t.amountJpy || 0;
+        totalInr += t.amountInr || 0;
+      }
+      const formattedTotal = totalJpy > 0 ? `¥${totalJpy.toLocaleString()}` : `₹${totalInr.toLocaleString()}`;
+      activities.push({
+        id: `tx_group_${dateKey}_${(primary.merchant || 'Merchant').replace(/\s+/g, '_')}`,
+        source: 'spend_iq',
+        activityType: 'grouped_transaction',
+        title: `${txList.length} purchases at ${primary.merchant || 'Merchant'} · ${formattedTotal} total.`,
+        detail: `${primary.category || 'Ledger'} · ${txList.length} transactions · Tap to view`,
+        amount: { jpy: totalJpy, inr: totalInr },
+        category: primary.category,
+        spender: primary.spender,
+        merchant: primary.merchant,
+        relatedEntityId: primary.id,
+        occurredAt,
+        dateKey,
+        dateHeader,
+        timeString,
+        isGrouped: true,
+        groupedCount: txList.length,
+        subTransactions: txList,
+      });
+    } else {
+      const amountFormatted = primary.amountJpy
+        ? `¥${primary.amountJpy.toLocaleString()}`
+        : primary.amountInr
+        ? `₹${primary.amountInr.toLocaleString()}`
+        : '¥0';
+      const title =
+        primary.spender === 'Dad'
+          ? `Dad spent ${amountFormatted} at ${primary.merchant || 'Merchant'}.`
+          : `You spent ${amountFormatted} at ${primary.merchant || 'Merchant'}.`;
+      activities.push({
+        id: `tx_${primary.id}`,
+        source: 'spend_iq',
+        activityType: 'transaction',
+        title,
+        detail: [primary.spender !== 'Son' ? primary.spender : null, primary.cardUsed, primary.category]
+          .filter(Boolean)
+          .join(' · '),
+        amount: { jpy: primary.amountJpy, inr: primary.amountInr },
+        category: primary.category,
+        spender: primary.spender,
+        merchant: primary.merchant,
+        cardUsed: primary.cardUsed,
+        relatedEntityId: primary.id,
+        occurredAt,
+        dateKey,
+        dateHeader,
+        timeString,
+      });
+    }
+  });
+
+  return {
+    activities,
+    spendingContext: {
+      todaySpentJpy,
+      todaySpentInr,
+      todayTxCount,
+      weekSpentJpy,
+      weekSpentInr,
+    },
+  };
+}
 
 export async function fetchSpendIqActivities(
   options: FetchTransactionsOptions = {}
@@ -37,52 +167,75 @@ export async function fetchSpendIqActivities(
   if (options.showAllSpenders !== undefined) params.set('showAllSpenders', String(options.showAllSpenders));
   if (options.spender) params.set('spender', options.spender);
   if (options.limitDays !== undefined) params.set('limitDays', String(options.limitDays));
-  else params.set('limitDays', '30');
+  else params.set('limitDays', '90');
 
   try {
     const res = await fetch(`/api/spendiq/transactions?${params.toString()}`);
-    if (!res.ok) {
-      const errorData = await res.json().catch(() => ({}));
-      throw new Error(errorData.error || `HTTP ${res.status}: Failed to fetch Spend IQ transactions`);
-    }
-
-    const data = await res.json();
-    const result: SpendIqFetchResult = {
-      activities: data.activities || [],
-      spendingContext: data.spendingContext,
-    };
-
-    if (result.activities.length > 0) {
-      try {
-        localStorage.setItem(LOCAL_SPENDIQ_CACHE_KEY, JSON.stringify(result));
-      } catch {}
-    }
-
-    return result;
-  } catch (err: any) {
-    console.warn('Network fetch for Spend IQ failed, checking client cache:', err.message);
-    try {
-      const cached = localStorage.getItem(LOCAL_SPENDIQ_CACHE_KEY);
-      if (cached) {
-        const parsed = JSON.parse(cached);
-        if (parsed && Array.isArray(parsed.activities) && parsed.activities.length > 0) {
-          return parsed;
-        }
+    if (res.ok) {
+      const data = await res.json();
+      if (data && Array.isArray(data.activities) && data.activities.length > 0) {
+        const result: SpendIqFetchResult = {
+          activities: data.activities,
+          spendingContext: data.spendingContext,
+        };
+        try {
+          localStorage.setItem(LOCAL_SPENDIQ_CACHE_KEY, JSON.stringify(result));
+        } catch {}
+        return result;
       }
-    } catch {}
-
-    // If no cache, return empty result gracefully rather than breaking the application view
-    return {
-      activities: [],
-      spendingContext: {
-        todaySpentJpy: 0,
-        todaySpentInr: 0,
-        todayTxCount: 0,
-        weekSpentJpy: 0,
-        weekSpentInr: 0,
-      },
-    };
+    }
+  } catch (err: any) {
+    console.warn('Backend /api/spendiq/transactions fetch failed:', err.message);
   }
+
+  // Fallback 1: Try direct RTDB fetch from client
+  try {
+    const directRes = await fetch(DIRECT_RTDB_URL);
+    if (directRes.ok) {
+      const rawData = await directRes.json();
+      const list: SpendIqRawTransaction[] = Array.isArray(rawData)
+        ? rawData.filter(Boolean)
+        : rawData && typeof rawData === 'object'
+        ? (Object.values(rawData).filter(Boolean) as SpendIqRawTransaction[])
+        : [];
+      if (list.length > 0) {
+        const formatted = formatRawTransactionsToSpendIqResult(list, options);
+        try {
+          localStorage.setItem(LOCAL_SPENDIQ_CACHE_KEY, JSON.stringify(formatted));
+        } catch {}
+        return formatted;
+      }
+    }
+  } catch (err: any) {
+    console.warn('Direct RTDB fetch failed:', err.message);
+  }
+
+  // Fallback 2: Check localStorage cache
+  try {
+    const cached = localStorage.getItem(LOCAL_SPENDIQ_CACHE_KEY);
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      if (parsed && Array.isArray(parsed.activities) && parsed.activities.length > 0) {
+        return parsed;
+      }
+    }
+  } catch {}
+
+  // Fallback 3: Bundled fallback snapshot
+  if (Array.isArray(spendiqFallback) && spendiqFallback.length > 0) {
+    return formatRawTransactionsToSpendIqResult(spendiqFallback as SpendIqRawTransaction[], options);
+  }
+
+  return {
+    activities: [],
+    spendingContext: {
+      todaySpentJpy: 0,
+      todaySpentInr: 0,
+      todayTxCount: 0,
+      weekSpentJpy: 0,
+      weekSpentInr: 0,
+    },
+  };
 }
 
 export interface SyncCalendarOptions {

@@ -75,9 +75,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onDisconnectGitHub,
 }) => {
   const linked = getLinkedProviders(user);
-  const isGoogleActive =
-    (linked.isGoogleLinked || (user?.email && user.email.includes('@gmail.com'))) &&
-    hasCalendarToken;
+  const hasEverLinkedGoogle = Boolean(
+    linked.isGoogleLinked ||
+    (user?.providerData?.some((p) => p.providerId === 'google.com')) ||
+    (user?.email && user.email.includes('@gmail.com'))
+  );
+  const isGoogleActive = hasEverLinkedGoogle && hasCalendarToken;
 
   const handleDismiss = () => {
     triggerHaptic('light');
@@ -342,7 +345,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
                             <span className="truncate">{linked.googleEmail || user?.email || 'Connected'} · Active</span>
                           </>
-                        ) : linked.isGoogleLinked || user ? (
+                        ) : hasEverLinkedGoogle ? (
                           <>
                             <AlertCircle className="w-3.5 h-3.5 text-amber-500 shrink-0" />
                             <span className="text-amber-600 dark:text-amber-400">Token expired — reconnect for schedule</span>
@@ -369,7 +372,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         }}
                         className="min-h-[34px] px-3.5 text-[12px] font-semibold bg-blue-600 hover:bg-blue-700 active:scale-95 text-white rounded-xl transition-all cursor-pointer shadow-xs shrink-0"
                       >
-                        {linked.isGoogleLinked || user ? 'Reconnect' : 'Connect'}
+                        {hasEverLinkedGoogle ? 'Reconnect' : 'Connect'}
                       </button>
                     )}
                   </div>

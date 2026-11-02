@@ -89,6 +89,34 @@ export const getAccessToken = (): string | null => {
   return null;
 };
 
+const GITHUB_IDENTITY_KEY = 'kairo_github_identity';
+
+export interface CachedGithubIdentity {
+  email?: string;
+  username?: string;
+  displayName?: string;
+  uid?: string;
+}
+
+export const saveCachedGithubIdentity = (info: CachedGithubIdentity | null) => {
+  try {
+    if (info) {
+      localStorage.setItem(GITHUB_IDENTITY_KEY, JSON.stringify(info));
+    } else {
+      localStorage.removeItem(GITHUB_IDENTITY_KEY);
+    }
+  } catch {}
+};
+
+export const getCachedGithubIdentity = (): CachedGithubIdentity | null => {
+  try {
+    const raw = localStorage.getItem(GITHUB_IDENTITY_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+};
+
 export interface LinkedProvidersInfo {
   isGoogleLinked: boolean;
   isGithubLinked: boolean;
@@ -98,19 +126,25 @@ export interface LinkedProvidersInfo {
 }
 
 export const getLinkedProviders = (user: User | null): LinkedProvidersInfo => {
-  if (!user || !user.providerData) {
+  const cachedGithub = getCachedGithubIdentity();
+  const cachedGoogleToken = getAccessToken();
+
+  if (!user && !cachedGithub && !cachedGoogleToken) {
     return { isGoogleLinked: false, isGithubLinked: false };
   }
 
-  const googleData = user.providerData.find((p) => p.providerId === 'google.com');
-  const githubData = user.providerData.find((p) => p.providerId === 'github.com');
+  const googleData = user?.providerData?.find((p) => p.providerId === 'google.com');
+  const githubData = user?.providerData?.find((p) => p.providerId === 'github.com');
+
+  const isGoogleLinked = Boolean(googleData || cachedGoogleToken);
+  const isGithubLinked = Boolean(githubData || cachedGithub);
 
   return {
-    isGoogleLinked: Boolean(googleData),
-    isGithubLinked: Boolean(githubData),
-    googleEmail: googleData?.email || (user.email && user.email.includes('@gmail.com') ? user.email : undefined),
-    githubEmail: githubData?.email || undefined,
-    githubUsername: githubData?.displayName || undefined,
+    isGoogleLinked,
+    isGithubLinked,
+    googleEmail: googleData?.email || (user?.email && user.email.includes('@') ? user.email : undefined),
+    githubEmail: githubData?.email || cachedGithub?.email || undefined,
+    githubUsername: githubData?.displayName || cachedGithub?.username || cachedGithub?.displayName || undefined,
   };
 };
 
@@ -123,8 +157,12 @@ export const initAuth = (
       const token = getAccessToken();
       if (onAuthSuccess) onAuthSuccess(user, token);
     } else {
-      setCachedAccessToken(null);
-      if (onAuthFailure) onAuthFailure();
+      const cachedGh = getCachedGithubIdentity();
+      const cachedToken = getAccessToken();
+      if (!cachedGh && !cachedToken) {
+        setCachedAccessToken(null);
+        if (onAuthFailure) onAuthFailure();
+      }
     }
   });
 };
@@ -132,23 +170,39 @@ export const initAuth = (
 /**
  * Connect or sign in with Google.
  * Handles both new sign-ins and linking with an existing signed-in account (e.g. GitHub).
- * Gracefully resolves 'auth/account-exists-with-different-credential' and 'auth/credential-already-in-use'.
+ * Seamlessly resolves 'auth/credential-already-in-use' without triggering the browser popup blocker.
  */
-export const googleSignIn = async (): Promise<{ user: User; accessToken: string } | null> => {
+export const googleSignIn = async (options?: { forceDirectSignIn?: boolean }): Promise<{ user: User; accessToken: string } | null> => {
   try {
     let resultUser: User;
     let token = '';
 
     const currentUser = auth.currentUser;
 
+    // If currentUser is signed in with GitHub:
+    // Store their GitHub identity first so it persists even if Firebase switches users
     if (currentUser) {
-      // User is already signed in (e.g. via GitHub).
-      // Attempt to link Google credentials so both providers are active.
+      const gh = currentUser.providerData?.find((p) => p.providerId === 'github.com');
+      saveCachedGithubIdentity({
+        email: gh?.email || currentUser.email || undefined,
+        displayName: gh?.displayName || currentUser.displayName || undefined,
+        username: gh?.displayName || currentUser.displayName || undefined,
+        uid: currentUser.uid,
+      });
+    }
+
+    if (currentUser && !options?.forceDirectSignIn) {
+      // Attempt linking first to keep one unified Firebase UID if possible
       try {
         const linkResult = await linkWithPopup(currentUser, googleProvider);
         resultUser = linkResult.user;
         const cred = GoogleAuthProvider.credentialFromResult(linkResult);
-        token = cred?.accessToken || '';
+        token =
+          cred?.accessToken ||
+          (linkResult as any)?._tokenResponse?.oauthAccessToken ||
+          (linkResult as any)?._tokenResponse?.accessToken ||
+          (linkResult as any)?.credential?.accessToken ||
+          '';
       } catch (linkError: any) {
         if (
           linkError?.code === 'auth/popup-closed-by-user' ||
@@ -157,49 +211,34 @@ export const googleSignIn = async (): Promise<{ user: User; accessToken: string 
           return null;
         }
 
-        // If the Google account is already registered as its own Firebase account or already linked:
+        // When the Google credential is already used by a separate Firebase account:
+        // DO NOT immediately call signInWithPopup inside this catch block because modern browsers
+        // classify the subsequent popup as untrusted and trigger 'auth/popup-blocked'.
+        // Instead, throw a structured conflict error that the UI can catch to offer a 1-tap direct sign-in!
         if (
           linkError?.code === 'auth/credential-already-in-use' ||
           linkError?.code === 'auth/account-exists-with-different-credential' ||
           linkError?.code === 'auth/provider-already-linked'
         ) {
-          console.info('Google account already exists or linked, proceeding with sign-in:', linkError.code);
-          const signInResult = await signInWithPopup(auth, googleProvider);
-          resultUser = signInResult.user;
-          const cred = GoogleAuthProvider.credentialFromResult(signInResult);
-          token = cred?.accessToken || '';
+          const err = new Error('Your Google account is already registered separately. Tap "Sign In with Google" to connect Calendar & Classroom.');
+          (err as any).code = 'auth/credential-already-in-use';
+          (err as any).isAccountConflict = true;
+          throw err;
         } else {
           throw linkError;
         }
       }
     } else {
-      // No active session: standard Google sign-in
-      try {
-        const signInResult = await signInWithPopup(auth, googleProvider);
-        resultUser = signInResult.user;
-        const cred = GoogleAuthProvider.credentialFromResult(signInResult);
-        token = cred?.accessToken || '';
-      } catch (signInErr: any) {
-        if (
-          signInErr?.code === 'auth/popup-closed-by-user' ||
-          signInErr?.code === 'auth/cancelled-popup-request'
-        ) {
-          return null;
-        }
-
-        // If account exists with GitHub, extract pending credential to save accessToken for APIs
-        if (signInErr?.code === 'auth/account-exists-with-different-credential') {
-          console.warn('Google sign-in encountered account-exists-with-different-credential');
-          const pendingCred = GoogleAuthProvider.credentialFromError(signInErr);
-          if (pendingCred?.accessToken) {
-            token = pendingCred.accessToken;
-            setCachedAccessToken(token);
-          }
-          throw new Error('Your email is already registered with GitHub. Sign in with GitHub first, then tap "Connect Google" to link both accounts.');
-        }
-
-        throw signInErr;
-      }
+      // Standard or direct Google sign-in (1 single popup gesture, never blocked!)
+      const signInResult = await signInWithPopup(auth, googleProvider);
+      resultUser = signInResult.user;
+      const cred = GoogleAuthProvider.credentialFromResult(signInResult);
+      token =
+        cred?.accessToken ||
+        (signInResult as any)?._tokenResponse?.oauthAccessToken ||
+        (signInResult as any)?._tokenResponse?.accessToken ||
+        (signInResult as any)?.credential?.accessToken ||
+        '';
     }
 
     if (token) {
@@ -237,6 +276,9 @@ export const githubSignIn = async (): Promise<{ user: User } | null> => {
     const currentUser = auth.currentUser;
     let resultUser: User;
 
+    // Cache existing Google token if present so Calendar remains active
+    const googleToken = getAccessToken();
+
     if (currentUser) {
       try {
         const linkResult = await linkWithPopup(currentUser, githubProvider);
@@ -263,6 +305,20 @@ export const githubSignIn = async (): Promise<{ user: User } | null> => {
     } else {
       const signInResult = await signInWithPopup(auth, githubProvider);
       resultUser = signInResult.user;
+    }
+
+    if (resultUser) {
+      const gh = resultUser.providerData?.find((p) => p.providerId === 'github.com');
+      saveCachedGithubIdentity({
+        email: gh?.email || resultUser.email || undefined,
+        displayName: gh?.displayName || resultUser.displayName || undefined,
+        username: gh?.displayName || resultUser.displayName || undefined,
+        uid: resultUser.uid,
+      });
+    }
+
+    if (googleToken) {
+      setCachedAccessToken(googleToken);
     }
 
     return { user: resultUser };
@@ -293,21 +349,18 @@ export const disconnectGoogle = async (): Promise<User | null> => {
     try {
       const updatedUser = await unlink(currentUser, 'google.com');
       return updatedUser;
-    } catch (err) {
-      console.warn('Failed to unlink Google, signing out:', err);
-      await signOut(auth);
-      return null;
+    } catch {
+      return currentUser;
     }
-  } else {
-    await signOut(auth);
-    return null;
   }
+  return currentUser;
 };
 
 /**
  * Disconnect GitHub provider. If Google is also connected, unlinks GitHub so Google stays active.
  */
 export const disconnectGithub = async (): Promise<User | null> => {
+  saveCachedGithubIdentity(null);
   const currentUser = auth.currentUser;
   if (!currentUser) return null;
 
@@ -318,19 +371,16 @@ export const disconnectGithub = async (): Promise<User | null> => {
     try {
       const updatedUser = await unlink(currentUser, 'github.com');
       return updatedUser;
-    } catch (err) {
-      console.warn('Failed to unlink GitHub, signing out:', err);
-      await signOut(auth);
-      return null;
+    } catch {
+      return currentUser;
     }
-  } else {
-    await signOut(auth);
-    return null;
   }
+  return currentUser;
 };
 
 export const logout = async () => {
   setCachedAccessToken(null);
+  saveCachedGithubIdentity(null);
   await signOut(auth);
 };
 

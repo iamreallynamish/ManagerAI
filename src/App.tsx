@@ -74,6 +74,7 @@ export default function App() {
   const [isSyncing, setIsSyncing] = useState(false);
   const [isInitialLoading, setIsInitialLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [accountConflict, setAccountConflict] = useState<boolean>(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isRemindersOpen, setIsRemindersOpen] = useState(false);
   const [isWeeklyRecapOpen, setIsWeeklyRecapOpen] = useState(false);
@@ -288,30 +289,36 @@ export default function App() {
   ]);
 
   // Connect Google Account (supports linking with existing GitHub session)
-  const handleConnectGoogle = async () => {
+  const handleConnectGoogle = async (options?: { forceDirectSignIn?: boolean }) => {
     try {
       setIsSyncing(true);
       setErrorMessage(null);
-      const res = await googleSignIn();
-      if (res && res.accessToken) {
+      setAccountConflict(false);
+      const res = await googleSignIn(options);
+      if (res && res.user) {
         setUser(res.user);
         if (res.user?.displayName && !localStorage.getItem('kairo_preferred_name')) {
           const firstName = res.user.displayName.split(' ')[0];
           if (firstName) setPreferredName(firstName);
         }
-        setHasGoogleToken(true);
-        await Promise.all([
-          loadGoogleData(res.accessToken, timeZone),
-          loadRemindersData(res.user.uid),
-        ]);
+        const effectiveToken = res.accessToken || getAccessToken();
+        if (effectiveToken) {
+          setHasGoogleToken(true);
+          await loadGoogleData(effectiveToken, timeZone);
+        }
+        await loadRemindersData(res.user.uid);
       }
     } catch (err: any) {
       if (
         err?.code !== 'auth/popup-closed-by-user' &&
         err?.code !== 'auth/cancelled-popup-request'
       ) {
-        console.error('Google sign-in failed:', err);
-        setErrorMessage(err.message || 'Google sign-in could not be completed.');
+        console.error('Google sign-in notice:', err);
+        if (err?.isAccountConflict) {
+          setAccountConflict(true);
+        } else {
+          setErrorMessage(err.message || 'Google sign-in could not be completed.');
+        }
       }
     } finally {
       setIsSyncing(false);
@@ -571,6 +578,26 @@ export default function App() {
               aria-label="Dismiss error"
             >
               ×
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Account conflict seamless resolution banner */}
+      {accountConflict && (
+        <div className="max-w-xl mx-auto px-4 w-full mb-3">
+          <div className="p-3.5 bg-blue-500/10 border border-blue-500/20 rounded-2xl text-[13px] text-blue-900 dark:text-blue-100 flex items-center justify-between gap-3">
+            <div>
+              <div className="font-semibold text-blue-950 dark:text-blue-50">Google Account Notice</div>
+              <div className="text-[12px] text-blue-800/80 dark:text-blue-200/80 mt-0.5">
+                Your Google account is already registered separately. Tap to sign in directly (your GitHub link remains saved).
+              </div>
+            </div>
+            <button
+              onClick={() => handleConnectGoogle({ forceDirectSignIn: true })}
+              className="min-h-[34px] px-3 text-[12px] font-semibold bg-blue-600 hover:bg-blue-700 active:scale-95 text-white rounded-xl transition-all cursor-pointer shadow-xs shrink-0"
+            >
+              Sign In Directly
             </button>
           </div>
         </div>
