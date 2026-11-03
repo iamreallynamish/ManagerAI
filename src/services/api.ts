@@ -242,13 +242,18 @@ export async function fetchSpendIqActivities(
 
 export interface SyncCalendarOptions {
   timeZone?: string;
-  timeMin?: string;
-  timeMax?: string;
+  accountEmail?: string;
+  fullSync?: boolean;
 }
 
 export interface SyncCalendarResult {
   activities: KairoActivity[];
   scheduleGapNote?: string;
+  nearestUpcomingEvent?: any;
+  upNext?: any;
+  syncMetadata?: any;
+  eventsStoredCount?: number;
+  upcomingEventsCount?: number;
 }
 
 export async function syncGoogleCalendar(
@@ -273,7 +278,60 @@ export async function syncGoogleCalendar(
   return {
     activities: data.activities || [],
     scheduleGapNote: data.scheduleGapNote,
+    nearestUpcomingEvent: data.nearestUpcomingEvent,
+    upNext: data.upNext,
+    syncMetadata: data.syncMetadata,
+    eventsStoredCount: data.eventsStoredCount,
+    upcomingEventsCount: data.upcomingEventsCount,
   };
+}
+
+export async function fetchCalendarUpNext(timeZone: string = 'Asia/Tokyo'): Promise<{
+  hasUpcomingEvent: boolean;
+  upNext: any | null;
+  rawEvent: any | null;
+  totalUpcomingCount: number;
+  syncMetadata?: any;
+}> {
+  try {
+    const res = await fetch(`/api/calendar/up-next?timeZone=${encodeURIComponent(timeZone)}`);
+    if (res.ok) {
+      return await res.json();
+    }
+  } catch (err: any) {
+    console.warn('Failed to query /api/calendar/up-next:', err.message);
+  }
+  return { hasUpcomingEvent: false, upNext: null, rawEvent: null, totalUpcomingCount: 0 };
+}
+
+export async function fetchCalendarDatabaseEvents(timeZone: string = 'Asia/Tokyo'): Promise<{
+  activities: KairoActivity[];
+  nearestUpcomingEvent: any | null;
+  upNext: any | null;
+  scheduleGapNote?: string;
+  syncMetadata?: any;
+}> {
+  try {
+    const res = await fetch(`/api/calendar/events?timeZone=${encodeURIComponent(timeZone)}`);
+    if (res.ok) {
+      return await res.json();
+    }
+  } catch (err: any) {
+    console.warn('Failed to query /api/calendar/events:', err.message);
+  }
+  return { activities: [], nearestUpcomingEvent: null, upNext: null };
+}
+
+export async function fetchCalendarDiagnostics(): Promise<any> {
+  try {
+    const res = await fetch('/api/calendar/diagnostics');
+    if (res.ok) {
+      return await res.json();
+    }
+  } catch (err: any) {
+    console.warn('Failed to query /api/calendar/diagnostics:', err.message);
+  }
+  return null;
 }
 
 export interface SyncClassroomResult {

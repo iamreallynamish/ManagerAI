@@ -46,6 +46,39 @@ const BUILD_METADATA = {
   runtime: process.env.VERCEL ? 'vercel-serverless-node' : 'node-express',
 };
 
+export interface StoredCalendarEvent {
+  id: string; // Google event ID
+  calendarId: string; // External calendar ID
+  accountEmail?: string;
+  summary: string;
+  description?: string;
+  location?: string;
+  hangoutLink?: string;
+  htmlLink?: string;
+  startDateTime?: string;
+  startDate?: string;
+  endDateTime?: string;
+  endDate?: string;
+  startMs: number;
+  endMs: number;
+  allDay: boolean;
+  status: string; // 'confirmed' | 'tentative' | 'cancelled'
+  recurringEventId?: string;
+  updatedAt: number;
+}
+
+export interface CalendarSyncMetadata {
+  lastSyncTimestamp: number;
+  lastSuccessfulSyncTime?: string;
+  status: 'idle' | 'syncing' | 'connected' | 'failed';
+  errorMessage?: string;
+  accountEmail?: string;
+  calendarsDiscovered: { id: string; summary: string; primary?: boolean }[];
+  eventsStoredCount: number;
+  upcomingEventsCount: number;
+  syncTokens: { [calendarId: string]: string };
+}
+
 export interface KairoStore {
   userState: {
     [userId: string]: {
@@ -64,6 +97,10 @@ export interface KairoStore {
     assignments: { [id: string]: { title: string; dueTimestamp: number; lastSeen: number } };
     txIds: string[];
     cachedTransactions?: SpendIqRawTransaction[];
+  };
+  calendarData?: {
+    events: { [id: string]: StoredCalendarEvent };
+    syncMetadata: CalendarSyncMetadata;
   };
 }
 
@@ -111,6 +148,17 @@ const DEFAULT_STORE: KairoStore = {
     txIds: [],
     cachedTransactions: [],
   },
+  calendarData: {
+    events: {},
+    syncMetadata: {
+      lastSyncTimestamp: 0,
+      status: 'idle',
+      calendarsDiscovered: [],
+      eventsStoredCount: 0,
+      upcomingEventsCount: 0,
+      syncTokens: {},
+    },
+  },
 };
 
 // In-memory store cache for fast serverless execution
@@ -156,6 +204,18 @@ async function getStore(): Promise<KairoStore> {
           }
         }
 
+        const loadedCalendarEvents: { [id: string]: StoredCalendarEvent } =
+          cloudData.calendarData?.events && typeof cloudData.calendarData.events === 'object'
+            ? cloudData.calendarData.events
+            : {};
+
+        const loadedSyncMeta: CalendarSyncMetadata = {
+          ...DEFAULT_STORE.calendarData!.syncMetadata,
+          ...(cloudData.calendarData?.syncMetadata || {}),
+          syncTokens: cloudData.calendarData?.syncMetadata?.syncTokens || {},
+          calendarsDiscovered: cloudData.calendarData?.syncMetadata?.calendarsDiscovered || [],
+        };
+
         memoryStore = {
           ...DEFAULT_STORE,
           ...cloudData,
@@ -163,6 +223,10 @@ async function getStore(): Promise<KairoStore> {
           portfolio: cloudData.portfolio?.holdings?.length ? cloudData.portfolio : DEFAULT_STORE.portfolio,
           reminders: loadedReminders.length > 0 ? loadedReminders : DEFAULT_STORE.reminders,
           snapshots: { ...DEFAULT_STORE.snapshots, ...(cloudData.snapshots || {}) },
+          calendarData: {
+            events: loadedCalendarEvents,
+            syncMetadata: loadedSyncMeta,
+          },
         };
         storeLoaded = true;
         storeLastSynced = now;
@@ -863,8 +927,381 @@ app.get('/api/spendiq/transactions', async (req: Request, res: Response) => {
   }
 });
 
-// --- 5. GOOGLE CALENDAR SERVICE ---
+// --- 5. GOOGLE CALENDAR SERVICE & CENTRAL DATABASE PERSISTENCE ---
+
+function parseCalendarEventTime(
+  startObj: { dateTime?: string; date?: string } | undefined,
+  endObj: { dateTime?: string; date?: string } | undefined,
+  timeZone: string
+): { startMs: number; endMs: number; allDay: boolean } {
+  if (startObj?.dateTime) {
+    const startMs = new Date(startObj.dateTime).getTime();
+    const endMs = endObj?.dateTime ? new Date(endObj.dateTime).getTime() : startMs + 3600000;
+    return { startMs, endMs, allDay: false };
+  }
+
+  if (startObj?.date) {
+    // Google Calendar all-day dates are in format YYYY-MM-DD
+    const [y, m, d] = startObj.date.split('-').map(Number);
+    // Calculate the timezone offset in minutes for that date in target timeZone
+    const tempDate = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
+    let offsetMinutes = 0;
+    try {
+      const tzString = new Intl.DateTimeFormat('en-US', {
+        timeZone,
+        timeZoneName: 'longOffset',
+      }).format(tempDate);
+      const offsetMatch = tzString.match(/GMT([+-]\d{2}):?(\d{2})?/);
+      if (offsetMatch) {
+        const hours = parseInt(offsetMatch[1], 10);
+        const mins = offsetMatch[2] ? parseInt(offsetMatch[2], 10) : 0;
+        offsetMinutes = hours * 60 + (hours >= 0 ? mins : -mins);
+      }
+    } catch {
+      offsetMinutes = 9 * 60; // Default to Tokyo (+09:00)
+    }
+
+    // Local midnight in timeZone:
+    const startMs = Date.UTC(y, m - 1, d, 0, 0, 0) - offsetMinutes * 60 * 1000;
+    let endMs = startMs + 86400000 - 1;
+
+    if (endObj?.date) {
+      const [ey, em, ed] = endObj.date.split('-').map(Number);
+      const rawEndMs = Date.UTC(ey, em - 1, ed, 0, 0, 0) - offsetMinutes * 60 * 1000;
+      if (rawEndMs > startMs) {
+        endMs = rawEndMs - 1;
+      }
+    }
+
+    return { startMs, endMs, allDay: true };
+  }
+
+  const now = Date.now();
+  return { startMs: now, endMs: now + 3600000, allDay: false };
+}
+
+function cleanCalendarSummary(raw: string): string {
+  if (!raw) return 'Scheduled commitment';
+  return raw
+    .replace(/^(Your next class is\s*|Your next event is\s*|You have\s*|Tomorrow, you have\s*|Tomorrow at [^:]+:\s*|In \d+ days:\s*)/i, '')
+    .replace(/\s+at\s+\d{1,2}:\d{2}\s*[AP]M(\s+today)?\.?/i, '')
+    .replace(/\(All day\)/i, '')
+    .trim();
+}
+
+function formatRelativeTimingString(targetMs: number, timeZone: string, isAllDay: boolean, timeString?: string): string {
+  const now = new Date();
+  const todayKey = getDateKey(now, timeZone);
+  const targetDate = new Date(targetMs);
+  const targetKey = getDateKey(targetDate, timeZone);
+
+  const tomorrowDate = new Date(now.getTime() + 86400000);
+  const tomorrowKey = getDateKey(tomorrowDate, timeZone);
+
+  const diffMs = targetMs - now.getTime();
+  const diffDays = Math.ceil(diffMs / 86400000);
+
+  const weekday = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'long' }).format(targetDate);
+  const monthDay = new Intl.DateTimeFormat('en-US', { timeZone, month: 'short', day: 'numeric' }).format(targetDate);
+
+  if (targetKey === todayKey) {
+    return isAllDay ? 'Today (All day)' : `Today at ${timeString}`;
+  } else if (targetKey === tomorrowKey) {
+    return isAllDay ? 'Tomorrow (All day)' : `Tomorrow at ${timeString}`;
+  } else if (diffDays <= 6) {
+    return isAllDay ? `In ${diffDays} days (${weekday}, All day)` : `In ${diffDays} days (${weekday}) at ${timeString}`;
+  } else {
+    return isAllDay ? `In ${diffDays} days on ${monthDay} (All day)` : `In ${diffDays} days on ${monthDay} at ${timeString}`;
+  }
+}
+
+function formatCalendarUpNext(event: StoredCalendarEvent, timeZone: string) {
+  const now = new Date();
+  const nowMs = now.getTime();
+  const cleanTitle = cleanCalendarSummary(event.summary);
+  const isClass =
+    cleanTitle.toLowerCase().includes('lecture') ||
+    cleanTitle.toLowerCase().includes('class') ||
+    cleanTitle.toLowerCase().includes('seminar');
+
+  const { timeString } = formatDateTime(event.startMs, timeZone);
+  const timing = formatRelativeTimingString(event.startMs, timeZone, event.allDay, timeString);
+  const diffDays = Math.max(0, Math.ceil((event.startMs - nowMs) / 86400000));
+
+  const detailParts: string[] = [];
+  if (event.location) detailParts.push(event.location);
+  if (event.hangoutLink) detailParts.push('Google Meet');
+  if (event.description && detailParts.length === 0) {
+    const cleanDesc = event.description.split('\n')[0].slice(0, 80);
+    if (cleanDesc) detailParts.push(cleanDesc);
+  }
+
+  return {
+    id: `upnext_cal_${event.id}`,
+    category: (isClass ? 'class' : 'event') as 'class' | 'event',
+    headline: cleanTitle,
+    contextTime: timing,
+    detail: detailParts.length > 0 ? detailParts.join(' · ') : 'Google Calendar Event',
+    urgency: (diffDays === 0 ? 'now' : diffDays === 1 ? 'today' : 'soon') as 'now' | 'today' | 'soon',
+    link: event.htmlLink,
+    location: event.location,
+    startMs: event.startMs,
+    endMs: event.endMs,
+    allDay: event.allDay,
+    calendarId: event.calendarId,
+  };
+}
+
+function buildCalendarActivitiesFromStore(
+  events: StoredCalendarEvent[],
+  timeZone: string
+): { activities: KairoActivity[]; scheduleGapNote?: string; nearestUpcomingEvent: StoredCalendarEvent | null } {
+  const now = new Date();
+  const nowMs = now.getTime();
+  const todayKey = getDateKey(now, timeZone);
+  const tomorrowDate = new Date(nowMs + 86400000);
+  const tomorrowKey = getDateKey(tomorrowDate, timeZone);
+  const sevenDaysAgoMs = nowMs - 7 * 86400000;
+
+  const validEvents = events.filter((e) => e && e.status !== 'cancelled');
+
+  const pastItems: StoredCalendarEvent[] = [];
+  const todayItems: StoredCalendarEvent[] = [];
+  const tomorrowItems: StoredCalendarEvent[] = [];
+  const futureItems: StoredCalendarEvent[] = [];
+
+  for (const item of validEvents) {
+    const itemDateKey = getDateKey(new Date(item.startMs), timeZone);
+    if (item.endMs < nowMs) {
+      if (item.startMs >= sevenDaysAgoMs) {
+        pastItems.push(item);
+      }
+    } else if (itemDateKey === todayKey) {
+      todayItems.push(item);
+    } else if (itemDateKey === tomorrowKey) {
+      tomorrowItems.push(item);
+    } else if (item.startMs > nowMs) {
+      futureItems.push(item);
+    }
+  }
+
+  // Sort chronologically
+  pastItems.sort((a, b) => b.startMs - a.startMs);
+  todayItems.sort((a, b) => a.startMs - b.startMs);
+  tomorrowItems.sort((a, b) => a.startMs - b.startMs);
+  futureItems.sort((a, b) => a.startMs - b.startMs);
+
+  const activities: KairoActivity[] = [];
+
+  // 1. Past completed events (last 7 days window)
+  for (const item of pastItems) {
+    const { dateKey, dateHeader, timeString } = formatDateTime(item.startMs, timeZone);
+    const summary = cleanCalendarSummary(item.summary);
+    const detailParts: string[] = [];
+    if (item.location) detailParts.push(item.location);
+    if (item.hangoutLink) detailParts.push('Google Meet');
+
+    activities.push({
+      id: `cal_past_${item.id}`,
+      source: 'calendar',
+      activityType: 'calendar_event',
+      title: item.allDay ? `${summary} (Completed)` : `Scheduled event completed: ${summary}`,
+      detail: detailParts.length > 0 ? detailParts.join(' · ') : undefined,
+      relatedEntityId: item.id,
+      occurredAt: item.startMs,
+      endAt: item.endMs,
+      allDay: item.allDay,
+      link: item.htmlLink,
+      dateKey,
+      dateHeader,
+      timeString: item.allDay ? 'All day' : timeString,
+    });
+  }
+
+  // 2. Schedule gap note calculation for today
+  let scheduleGapNote: string | undefined;
+  if (todayItems.length > 0) {
+    const timedEvents = todayItems.filter((i) => !i.allDay);
+    if (timedEvents.length > 1) {
+      for (let i = 0; i < timedEvents.length - 1; i++) {
+        const gapMinutes = Math.floor((timedEvents[i + 1].startMs - timedEvents[i].endMs) / 60000);
+        if (gapMinutes >= 120) {
+          const gapHours = (gapMinutes / 60).toFixed(1).replace('.0', '');
+          scheduleGapNote = `You have a ${gapHours}-hour gap between ${timedEvents[i].summary} and ${timedEvents[i + 1].summary}.`;
+          break;
+        }
+      }
+    }
+    const lastEvent = timedEvents[timedEvents.length - 1];
+    if (lastEvent && !scheduleGapNote) {
+      const { timeString: lastEndTime } = formatDateTime(lastEvent.endMs, timeZone);
+      const lastEndDate = new Date(lastEvent.endMs);
+      let endHour = lastEndDate.getHours();
+      try {
+        const parts = new Intl.DateTimeFormat('en-US', { timeZone, hour: 'numeric', hour12: false }).formatToParts(lastEndDate);
+        const hPart = parts.find((p) => p.type === 'hour');
+        if (hPart) endHour = parseInt(hPart.value, 10);
+      } catch {}
+      if (endHour <= 14) {
+        scheduleGapNote = `Your afternoon is free today · Last event ends at ${lastEndTime}.`;
+      }
+    }
+  }
+
+  // 3. Today's items
+  const upcomingToday = todayItems.filter((item) => item.endMs > nowMs);
+  todayItems.forEach((item, index) => {
+    const { dateKey, dateHeader, timeString } = formatDateTime(item.startMs, timeZone);
+    const summary = cleanCalendarSummary(item.summary);
+    const isClass =
+      summary.toLowerCase().includes('class') ||
+      summary.toLowerCase().includes('lecture') ||
+      summary.toLowerCase().includes('seminar');
+
+    let title = '';
+    if (item.allDay) {
+      title = `Today: ${summary} (All day)`;
+    } else if (item.startMs > nowMs && item === upcomingToday[0]) {
+      title = isClass ? `Your next class is ${summary} at ${timeString}.` : `Your next event is ${summary} at ${timeString}.`;
+    } else if (upcomingToday.length > 1 && item === upcomingToday[upcomingToday.length - 1]) {
+      title = `Your last event for today starts at ${timeString}: ${summary}.`;
+    } else {
+      title = `You have ${summary} at ${timeString} today.`;
+    }
+
+    const detailParts: string[] = [];
+    if (item.location) detailParts.push(item.location);
+    if (item.hangoutLink) detailParts.push('Google Meet');
+
+    activities.push({
+      id: `cal_${item.id}`,
+      source: 'calendar',
+      activityType: 'calendar_event',
+      title,
+      detail: detailParts.length > 0 ? detailParts.join(' · ') : undefined,
+      relatedEntityId: item.id,
+      occurredAt: item.startMs,
+      endAt: item.endMs,
+      allDay: item.allDay,
+      link: item.htmlLink,
+      dateKey,
+      dateHeader,
+      timeString: item.allDay ? 'All day' : timeString,
+      scheduleGapNote: index === 0 ? scheduleGapNote : undefined,
+    });
+  });
+
+  // 4. Tomorrow's items
+  if (tomorrowItems.length === 1) {
+    const first = tomorrowItems[0];
+    const { dateKey, dateHeader, timeString } = formatDateTime(first.startMs, timeZone);
+    const summary = cleanCalendarSummary(first.summary);
+    const title = first.allDay ? `Tomorrow, you have ${summary} (All day).` : `Tomorrow, you have ${summary} at ${timeString}.`;
+    const detailParts: string[] = [];
+    if (first.location) detailParts.push(first.location);
+    if (first.hangoutLink) detailParts.push('Google Meet');
+
+    activities.push({
+      id: `cal_${first.id}`,
+      source: 'calendar',
+      activityType: 'calendar_event',
+      title,
+      detail: detailParts.length > 0 ? detailParts.join(' · ') : undefined,
+      relatedEntityId: first.id,
+      occurredAt: first.startMs,
+      endAt: first.endMs,
+      allDay: first.allDay,
+      link: first.htmlLink,
+      dateKey,
+      dateHeader,
+      timeString: first.allDay ? 'All day' : timeString,
+    });
+  } else if (tomorrowItems.length > 1) {
+    const first = tomorrowItems[0];
+    const { timeString: firstTimeString } = formatDateTime(first.startMs, timeZone);
+    const firstSummary = cleanCalendarSummary(first.summary);
+
+    activities.push({
+      id: 'cal_tomorrow_summary',
+      source: 'calendar',
+      activityType: 'calendar_summary',
+      title: `Tomorrow is a busy day — you have ${tomorrowItems.length} events, starting with ${firstSummary} at ${firstTimeString}.`,
+      relatedEntityId: 'tomorrow_summary',
+      occurredAt: first.startMs - 1000,
+      dateKey: tomorrowKey,
+      dateHeader: 'TOMORROW',
+      timeString: 'Preview',
+    });
+
+    for (const item of tomorrowItems) {
+      const { dateKey, dateHeader, timeString } = formatDateTime(item.startMs, timeZone);
+      const summary = cleanCalendarSummary(item.summary);
+      const detailParts: string[] = [];
+      if (item.location) detailParts.push(item.location);
+      if (item.hangoutLink) detailParts.push('Google Meet');
+
+      activities.push({
+        id: `cal_${item.id}`,
+        source: 'calendar',
+        activityType: 'calendar_event',
+        title: item.allDay ? `Tomorrow: ${summary} (All day)` : `Tomorrow at ${timeString}: ${summary}`,
+        detail: detailParts.length > 0 ? detailParts.join(' · ') : undefined,
+        relatedEntityId: item.id,
+        occurredAt: item.startMs,
+        endAt: item.endMs,
+        allDay: item.allDay,
+        link: item.htmlLink,
+        dateKey,
+        dateHeader,
+        timeString: item.allDay ? 'All day' : timeString,
+      });
+    }
+  }
+
+  // 5. Future items
+  for (const item of futureItems) {
+    const { dateKey, dateHeader, timeString } = formatDateTime(item.startMs, timeZone);
+    const summary = cleanCalendarSummary(item.summary);
+    const diffDays = Math.max(2, Math.ceil((item.startMs - nowMs) / 86400000));
+    const detailParts: string[] = [];
+    if (item.location) detailParts.push(item.location);
+    if (item.hangoutLink) detailParts.push('Google Meet');
+
+    activities.push({
+      id: `cal_${item.id}`,
+      source: 'calendar',
+      activityType: 'calendar_event',
+      title: item.allDay ? `In ${diffDays} days: ${summary} (All day)` : `In ${diffDays} days: ${summary} at ${timeString}`,
+      detail: detailParts.length > 0 ? detailParts.join(' · ') : undefined,
+      relatedEntityId: item.id,
+      occurredAt: item.startMs,
+      endAt: item.endMs,
+      allDay: item.allDay,
+      link: item.htmlLink,
+      dateKey,
+      dateHeader,
+      timeString: item.allDay ? 'All day' : timeString,
+    });
+  }
+
+  // Chronologically nearest upcoming event across all connected calendars
+  const allUpcoming = [...todayItems, ...tomorrowItems, ...futureItems]
+    .filter((e) => e.endMs > nowMs)
+    .sort((a, b) => a.startMs - b.startMs);
+
+  const nearestUpcomingEvent = allUpcoming[0] || null;
+
+  return {
+    activities,
+    scheduleGapNote,
+    nearestUpcomingEvent,
+  };
+}
+
+// POST /api/calendar/sync
+// Full synchronization pipeline: OAuth -> Calendar Discovery -> Events Sync (initial/incremental) -> RTDB Persistence -> Up Next
 app.post('/api/calendar/sync', async (req: Request, res: Response) => {
+  const syncStartTime = Date.now();
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -876,390 +1313,357 @@ app.post('/api/calendar/sync', async (req: Request, res: Response) => {
 
     const accessToken = authHeader.split(' ')[1];
     const timeZone = (req.body.timeZone as string) || 'Asia/Tokyo';
-
-    const now = new Date();
-    const todayKey = getDateKey(now, timeZone);
-    const tomorrowDate = new Date(now.getTime() + 86400000);
-    const tomorrowKey = getDateKey(tomorrowDate, timeZone);
-    const nowMs = now.getTime();
-    const sevenDaysAgoMs = nowMs - 7 * 86400000;
-
-    const timeMin = new Date(sevenDaysAgoMs).toISOString();
-    const timeMax = new Date(nowMs + 60 * 24 * 60 * 60 * 1000).toISOString();
-
-    const calendarUrl = `https://www.googleapis.com/calendar/v3/calendars/primary/events?singleEvents=true&orderBy=startTime&timeMin=${encodeURIComponent(
-      timeMin
-    )}&timeMax=${encodeURIComponent(timeMax)}`;
-
-    const gRes = await fetch(calendarUrl, {
-      headers: { Authorization: `Bearer ${accessToken}` },
-    });
-
-    if (!gRes.ok) {
-      const errText = await gRes.text();
-      return res.status(gRes.status).json({
-        success: false,
-        error: `Google Calendar API error: ${gRes.statusText}`,
-        details: errText,
-      });
-    }
-
-    const gData = await gRes.json();
-    const items = gData.items || [];
-
-    const pastItems: any[] = [];
-    const todayItems: any[] = [];
-    const tomorrowItems: any[] = [];
-    const futureItems: any[] = [];
-    const seenEventIds = new Set<string>();
-
-    for (const item of items) {
-      if (item.status === 'cancelled') continue;
-      if (!item.id || seenEventIds.has(item.id)) continue;
-      seenEventIds.add(item.id);
-
-      const startTimeStr = item.start?.dateTime || item.start?.date;
-      if (!startTimeStr) continue;
-
-      const eventDate = new Date(startTimeStr);
-      const eventTimeMs = eventDate.getTime();
-      const eventDateKey = getDateKey(eventDate, timeZone);
-
-      if (eventTimeMs < nowMs) {
-        if (eventTimeMs >= sevenDaysAgoMs) {
-          pastItems.push(item);
-        }
-      } else if (eventDateKey === todayKey) {
-        todayItems.push(item);
-      } else if (eventDateKey === tomorrowKey) {
-        tomorrowItems.push(item);
-      } else {
-        futureItems.push(item);
-      }
-    }
-
-    todayItems.sort((a, b) => {
-      const ta = new Date(a.start?.dateTime || a.start?.date).getTime();
-      const tb = new Date(b.start?.dateTime || b.start?.date).getTime();
-      return ta - tb;
-    });
-
-    tomorrowItems.sort((a, b) => {
-      const ta = new Date(a.start?.dateTime || a.start?.date).getTime();
-      const tb = new Date(b.start?.dateTime || b.start?.date).getTime();
-      return ta - tb;
-    });
-
-    futureItems.sort((a, b) => {
-      const ta = new Date(a.start?.dateTime || a.start?.date).getTime();
-      const tb = new Date(b.start?.dateTime || b.start?.date).getTime();
-      return ta - tb;
-    });
-
-    const activities: KairoActivity[] = [];
-
-    pastItems.sort((a, b) => {
-      const ta = new Date(a.start?.dateTime || a.start?.date).getTime();
-      const tb = new Date(b.start?.dateTime || b.start?.date).getTime();
-      return tb - ta;
-    });
-
-    for (const item of pastItems) {
-      const startTimeStr = item.start?.dateTime || item.start?.date;
-      const isAllDay = !item.start?.dateTime;
-      const occurredAt = new Date(startTimeStr).getTime();
-      const endAt = item.end?.dateTime || item.end?.date ? new Date(item.end?.dateTime || item.end?.date).getTime() : undefined;
-      const { dateKey, dateHeader, timeString } = formatDateTime(occurredAt, timeZone);
-      const summary = item.summary || 'Scheduled commitment';
-
-      const detailParts: string[] = [];
-      if (item.location) detailParts.push(item.location);
-      if (item.hangoutLink) detailParts.push('Google Meet');
-
-      activities.push({
-        id: `cal_past_${item.id}`,
-        source: 'calendar',
-        activityType: 'calendar_event',
-        title: isAllDay ? `${summary} (Completed)` : `Scheduled event completed: ${summary}`,
-        detail: detailParts.length > 0 ? detailParts.join(' · ') : undefined,
-        relatedEntityId: item.id,
-        occurredAt,
-        endAt,
-        allDay: isAllDay,
-        link: item.htmlLink,
-        dateKey,
-        dateHeader,
-        timeString: isAllDay ? 'All day' : timeString,
-      });
-    }
-
-    let scheduleGapNote: string | undefined;
-    if (todayItems.length > 0) {
-      const timedEvents = todayItems.filter((i) => i.start?.dateTime && i.end?.dateTime);
-      if (timedEvents.length > 1) {
-        for (let i = 0; i < timedEvents.length - 1; i++) {
-          const endCurr = new Date(timedEvents[i].end.dateTime).getTime();
-          const startNext = new Date(timedEvents[i + 1].start.dateTime).getTime();
-          const gapMinutes = Math.floor((startNext - endCurr) / 60000);
-          if (gapMinutes >= 120) {
-            const gapHours = (gapMinutes / 60).toFixed(1).replace('.0', '');
-            const titleA = timedEvents[i].summary || 'Event';
-            const titleB = timedEvents[i + 1].summary || 'Next event';
-            scheduleGapNote = `You have a ${gapHours}-hour gap between ${titleA} and ${titleB}.`;
-            break;
-          }
-        }
-      }
-
-      const lastEvent = timedEvents[timedEvents.length - 1];
-      if (lastEvent) {
-        const lastEndDate = new Date(lastEvent.end.dateTime);
-        const { timeString: lastEndTime } = formatDateTime(lastEndDate.getTime(), timeZone);
-        let endHour = 12;
-        try {
-          const parts = new Intl.DateTimeFormat('en-US', {
-            timeZone,
-            hour: 'numeric',
-            hour12: false,
-          }).formatToParts(lastEndDate);
-          const hPart = parts.find((p) => p.type === 'hour');
-          if (hPart) endHour = parseInt(hPart.value, 10);
-        } catch {
-          endHour = lastEndDate.getHours();
-        }
-
-        if (endHour <= 14 && !scheduleGapNote) {
-          scheduleGapNote = `Your afternoon is free today · Last event ends at ${lastEndTime}.`;
-        }
-      }
-    }
-
-    const upcomingToday = todayItems.filter(
-      (item) => new Date(item.start?.dateTime || item.start?.date).getTime() > nowMs
-    );
+    let accountEmail = (req.body.accountEmail as string) || '';
+    const fullSync = Boolean(req.body.fullSync);
 
     const store = await getStore();
-
-    todayItems.forEach((item, index) => {
-      const startTimeStr = item.start?.dateTime || item.start?.date;
-      const isAllDay = !item.start?.dateTime;
-      const occurredAt = new Date(startTimeStr).getTime();
-      const endAt = item.end?.dateTime || item.end?.date ? new Date(item.end?.dateTime || item.end?.date).getTime() : undefined;
-      const { dateKey, dateHeader, timeString } = formatDateTime(occurredAt, timeZone);
-
-      const summary = item.summary || 'Scheduled appointment';
-      const isClass =
-        summary.toLowerCase().includes('class') ||
-        summary.toLowerCase().includes('lecture') ||
-        summary.toLowerCase().includes('seminar');
-
-      let isRescheduled = false;
-      let originalTime: string | undefined;
-      const prev = store.snapshots.calendarEvents[item.id];
-      if (prev && prev.startTime !== startTimeStr) {
-        isRescheduled = true;
-        const prevDt = new Date(prev.startTime);
-        originalTime = formatDateTime(prevDt.getTime(), timeZone).timeString;
-      }
-
-      store.snapshots.calendarEvents[item.id] = {
-        summary,
-        startTime: startTimeStr,
-        lastSeen: nowMs,
+    if (!store.calendarData) {
+      store.calendarData = {
+        events: {},
+        syncMetadata: {
+          lastSyncTimestamp: 0,
+          status: 'idle',
+          calendarsDiscovered: [],
+          eventsStoredCount: 0,
+          upcomingEventsCount: 0,
+          syncTokens: {},
+        },
       };
+    }
 
-      let title = '';
-      if (isRescheduled && originalTime) {
-        title = `${summary} rescheduled from ${originalTime} to ${timeString}.`;
-      } else if (isAllDay) {
-        title = `Today: ${summary} (All day)`;
-      } else if (occurredAt > nowMs && item === upcomingToday[0]) {
-        title = isClass
-          ? `Your next class is ${summary} at ${timeString}.`
-          : `Your next event is ${summary} at ${timeString}.`;
-      } else if (upcomingToday.length > 1 && item === upcomingToday[upcomingToday.length - 1]) {
-        title = `Your last event for today starts at ${timeString}: ${summary}.`;
-      } else {
-        title = `You have ${summary} at ${timeString} today.`;
-      }
+    store.calendarData.syncMetadata.status = 'syncing';
 
-      const detailParts = [];
-      if (item.location) detailParts.push(item.location);
-      if (item.hangoutLink) detailParts.push('Google Meet');
-
-      activities.push({
-        id: `cal_${item.id}`,
-        source: 'calendar',
-        activityType: 'calendar_event',
-        title,
-        detail: detailParts.length > 0 ? detailParts.join(' · ') : undefined,
-        relatedEntityId: item.id,
-        occurredAt,
-        endAt,
-        allDay: isAllDay,
-        link: item.htmlLink,
-        dateKey,
-        dateHeader,
-        timeString: isAllDay ? 'All day' : timeString,
-        isRescheduled,
-        originalTime,
-        scheduleGapNote: index === 0 ? scheduleGapNote : undefined,
-      });
-    });
-
-    if (tomorrowItems.length === 0) {
-      const tomorrowMidnightMs = tomorrowDate.setHours(0, 0, 0, 0);
-      activities.push({
-        id: `cal_tomorrow_empty`,
-        source: 'calendar',
-        activityType: 'calendar_empty',
-        title: 'Nothing scheduled for tomorrow.',
-        relatedEntityId: 'tomorrow_none',
-        occurredAt: tomorrowMidnightMs,
-        dateKey: tomorrowKey,
-        dateHeader: 'TOMORROW',
-        timeString: 'Tomorrow',
-      });
-    } else if (tomorrowItems.length === 1) {
-      const first = tomorrowItems[0];
-      const startTimeStr = first.start?.dateTime || first.start?.date;
-      const isAllDay = !first.start?.dateTime;
-      const occurredAt = new Date(startTimeStr).getTime();
-      const endAt = first.end?.dateTime || first.end?.date ? new Date(first.end?.dateTime || first.end?.date).getTime() : undefined;
-      const { dateKey, dateHeader, timeString } = formatDateTime(occurredAt, timeZone);
-      const summary = first.summary || 'Scheduled appointment';
-
-      const title = isAllDay
-        ? `Tomorrow, you have ${summary} (All day).`
-        : `Tomorrow, you have ${summary} at ${timeString}.`;
-
-      const detailParts = [];
-      if (first.location) detailParts.push(first.location);
-      if (first.hangoutLink) detailParts.push('Google Meet');
-
-      activities.push({
-        id: `cal_${first.id}`,
-        source: 'calendar',
-        activityType: 'calendar_event',
-        title,
-        detail: detailParts.length > 0 ? detailParts.join(' · ') : undefined,
-        relatedEntityId: first.id,
-        occurredAt,
-        endAt,
-        allDay: isAllDay,
-        link: first.htmlLink,
-        dateKey,
-        dateHeader,
-        timeString: isAllDay ? 'All day' : timeString,
-      });
-    } else {
-      const first = tomorrowItems[0];
-      const firstTimeStr = first.start?.dateTime || first.start?.date;
-      const { timeString: firstTimeString } = formatDateTime(new Date(firstTimeStr).getTime(), timeZone);
-      const firstSummary = first.summary || 'Events';
-
-      activities.push({
-        id: 'cal_tomorrow_summary',
-        source: 'calendar',
-        activityType: 'calendar_summary',
-        title: `Tomorrow is a busy day — you have ${tomorrowItems.length} events, starting with ${firstSummary} at ${firstTimeString}.`,
-        relatedEntityId: 'tomorrow_summary',
-        occurredAt: new Date(firstTimeStr).getTime() + 1,
-        dateKey: tomorrowKey,
-        dateHeader: 'TOMORROW',
-        timeString: 'Preview',
-      });
-
-      for (const item of tomorrowItems) {
-        const startTimeStr = item.start?.dateTime || item.start?.date;
-        const isAllDay = !item.start?.dateTime;
-        const occurredAt = new Date(startTimeStr).getTime();
-        const endAt = item.end?.dateTime || item.end?.date ? new Date(item.end?.dateTime || item.end?.date).getTime() : undefined;
-        const { dateKey, dateHeader, timeString } = formatDateTime(occurredAt, timeZone);
-        const summary = item.summary || 'Scheduled appointment';
-
-        const detailParts = [];
-        if (item.location) detailParts.push(item.location);
-        if (item.hangoutLink) detailParts.push('Google Meet');
-
-        activities.push({
-          id: `cal_${item.id}`,
-          source: 'calendar',
-          activityType: 'calendar_event',
-          title: `Tomorrow at ${timeString}: ${summary}`,
-          detail: detailParts.length > 0 ? detailParts.join(' · ') : undefined,
-          relatedEntityId: item.id,
-          occurredAt,
-          endAt,
-          allDay: isAllDay,
-          link: item.htmlLink,
-          dateKey,
-          dateHeader,
-          timeString: isAllDay ? 'All day' : timeString,
+    // 1. Discover user account email if not provided
+    if (!accountEmail || accountEmail === 'primary') {
+      try {
+        const userInfoRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+          headers: { Authorization: `Bearer ${accessToken}` },
         });
+        if (userInfoRes.ok) {
+          const uInfo = await userInfoRes.json();
+          if (uInfo.email) accountEmail = uInfo.email;
+        }
+      } catch (uErr) {
+        console.warn('[Calendar Sync] Could not fetch userinfo:', uErr);
       }
     }
 
-    for (const item of futureItems) {
-        const startTimeStr = item.start?.dateTime || item.start?.date;
-        const isAllDay = !item.start?.dateTime;
-        const occurredAt = new Date(startTimeStr).getTime();
-        const endAt = item.end?.dateTime || item.end?.date ? new Date(item.end?.dateTime || item.end?.date).getTime() : undefined;
-        const { dateKey, dateHeader, timeString } = formatDateTime(occurredAt, timeZone);
-        const summary = item.summary || 'Scheduled appointment';
-        const diffDays = Math.max(2, Math.ceil((occurredAt - now.getTime()) / 86400000));
+    // 2. Discover user calendars via /users/me/calendarList
+    // With graceful fallback to primary if calendar.readonly scope is missing or error
+    let discoveredCalendars: { id: string; summary: string; primary?: boolean }[] = [];
+    try {
+      const listRes = await fetch('https://www.googleapis.com/calendar/v3/users/me/calendarList?maxResults=50', {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      if (listRes.ok) {
+        const listData = await listRes.json();
+        const rawItems = listData.items || [];
+        discoveredCalendars = rawItems
+          .filter((c: any) => !c.deleted && c.selected !== false)
+          .map((c: any) => ({
+            id: c.id,
+            summary: c.summary || c.id,
+            primary: Boolean(c.primary),
+          }));
+      } else {
+        console.warn(`[Calendar Sync] calendarList returned HTTP ${listRes.status}, falling back to primary`);
+      }
+    } catch (listErr: any) {
+      console.warn('[Calendar Sync] Failed to query calendarList, falling back to primary:', listErr.message);
+    }
 
-        const detailParts = [];
-        if (item.location) detailParts.push(item.location);
-        if (item.hangoutLink) detailParts.push('Google Meet');
+    if (discoveredCalendars.length === 0) {
+      discoveredCalendars = [{ id: 'primary', summary: 'Primary Calendar', primary: true }];
+    }
 
-        const title = isAllDay
-          ? `${summary} (All day)`
-          : `${summary} at ${timeString}`;
+    store.calendarData.syncMetadata.calendarsDiscovered = discoveredCalendars;
+    if (accountEmail) {
+      store.calendarData.syncMetadata.accountEmail = accountEmail;
+    }
 
-        activities.push({
-          id: `cal_${item.id}`,
-          source: 'calendar',
-          activityType: 'calendar_event',
-          title: `In ${diffDays} days: ${title}`,
-          detail: detailParts.length > 0 ? detailParts.join(' · ') : undefined,
-          relatedEntityId: item.id,
-          occurredAt,
-          endAt,
-          allDay: isAllDay,
-          link: item.htmlLink,
-          dateKey,
-          dateHeader,
-          timeString: isAllDay ? 'All day' : timeString,
+    const now = new Date();
+    const nowMs = now.getTime();
+    const sevenDaysAgoMs = nowMs - 7 * 86400000;
+    const ninetyDaysFutureMs = nowMs + 90 * 86400000;
+    const timeMin = new Date(sevenDaysAgoMs).toISOString();
+    const timeMax = new Date(ninetyDaysFutureMs).toISOString();
+
+    let totalFetchedCount = 0;
+    let totalUpdatedCount = 0;
+    const errors: string[] = [];
+
+    // 3. Sync events from each discovered calendar
+    for (const cal of discoveredCalendars) {
+      const existingSyncToken = store.calendarData.syncMetadata.syncTokens?.[cal.id];
+      let useIncremental = Boolean(existingSyncToken && !fullSync);
+      let pageToken: string | undefined;
+      let nextSyncToken: string | undefined;
+
+      while (true) {
+        let requestUrl = '';
+        if (useIncremental && existingSyncToken) {
+          // Incremental sync request: do NOT include timeMin / timeMax (Google API requirement)
+          requestUrl = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(
+            cal.id
+          )}/events?maxResults=250&syncToken=${encodeURIComponent(existingSyncToken)}`;
+          if (pageToken) requestUrl += `&pageToken=${encodeURIComponent(pageToken)}`;
+        } else {
+          // Full/Initial sync request: singleEvents=true, orderBy=startTime, timeMin, timeMax
+          requestUrl = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(
+            cal.id
+          )}/events?singleEvents=true&orderBy=startTime&timeMin=${encodeURIComponent(timeMin)}&timeMax=${encodeURIComponent(
+            timeMax
+          )}&maxResults=250`;
+          if (pageToken) requestUrl += `&pageToken=${encodeURIComponent(pageToken)}`;
+        }
+
+        const eventsRes = await fetch(requestUrl, {
+          headers: { Authorization: `Bearer ${accessToken}` },
         });
+
+        // Handle expired sync token (HTTP 410 Gone) per Google Calendar API specification
+        if (eventsRes.status === 410 && useIncremental) {
+          console.warn(`[Calendar Sync] Sync token expired (HTTP 410) for calendar ${cal.id}. Performing fresh full sync.`);
+          delete store.calendarData.syncMetadata.syncTokens[cal.id];
+          useIncremental = false;
+          pageToken = undefined;
+          continue; // Restart with initial sync
+        }
+
+        if (!eventsRes.ok) {
+          const errBody = await eventsRes.text().catch(() => '');
+          errors.push(`Calendar ${cal.summary} (${cal.id}) HTTP ${eventsRes.status}: ${errBody.slice(0, 120)}`);
+          break;
+        }
+
+        const eventsData = await eventsRes.json();
+        const items = eventsData.items || [];
+        totalFetchedCount += items.length;
+
+        for (const item of items) {
+          if (!item.id) continue;
+
+          // Handle deleted or cancelled events
+          if (item.status === 'cancelled') {
+            if (store.calendarData.events[item.id]) {
+              delete store.calendarData.events[item.id];
+              totalUpdatedCount++;
+            }
+            continue;
+          }
+
+          // Parse start and end timestamps taking into account timezone and all-day events
+          const { startMs, endMs, allDay } = parseCalendarEventTime(item.start, item.end, timeZone);
+
+          store.calendarData.events[item.id] = {
+            id: item.id,
+            calendarId: cal.id,
+            accountEmail: accountEmail || undefined,
+            summary: item.summary || 'Scheduled commitment',
+            description: item.description,
+            location: item.location,
+            hangoutLink: item.hangoutLink,
+            htmlLink: item.htmlLink,
+            startDateTime: item.start?.dateTime,
+            startDate: item.start?.date,
+            endDateTime: item.end?.dateTime,
+            endDate: item.end?.date,
+            startMs,
+            endMs,
+            allDay,
+            status: item.status || 'confirmed',
+            recurringEventId: item.recurringEventId,
+            updatedAt: Date.now(),
+          };
+          totalUpdatedCount++;
+
+          // Maintain backwards compatibility with legacy snapshot map
+          store.snapshots.calendarEvents[item.id] = {
+            summary: item.summary || 'Scheduled commitment',
+            startTime: item.start?.dateTime || item.start?.date || new Date(startMs).toISOString(),
+            lastSeen: nowMs,
+          };
+        }
+
+        if (eventsData.nextSyncToken) {
+          nextSyncToken = eventsData.nextSyncToken;
+        }
+
+        if (eventsData.nextPageToken) {
+          pageToken = eventsData.nextPageToken;
+        } else {
+          break;
+        }
       }
 
-    persistStore({ snapshots: store.snapshots }).catch(() => {});
+      if (nextSyncToken) {
+        if (!store.calendarData.syncMetadata.syncTokens) {
+          store.calendarData.syncMetadata.syncTokens = {};
+        }
+        store.calendarData.syncMetadata.syncTokens[cal.id] = nextSyncToken;
+      }
+    }
 
-    // Compute chronologically nearest upcoming event across all horizons
-    const allUpcoming = [...todayItems, ...tomorrowItems, ...futureItems]
-      .filter((item) => new Date(item.start?.dateTime || item.start?.date).getTime() > nowMs)
-      .sort((a, b) => {
-        const ta = new Date(a.start?.dateTime || a.start?.date).getTime();
-        const tb = new Date(b.start?.dateTime || b.start?.date).getTime();
-        return ta - tb;
+    // 4. Compute upcoming count and nearest upcoming event
+    const allStoredEvents = Object.values(store.calendarData.events);
+    const upcomingEvents = allStoredEvents
+      .filter((e) => e && e.status !== 'cancelled' && e.endMs > nowMs)
+      .sort((a, b) => a.startMs - b.startMs);
+
+    // 5. Update sync metadata
+    store.calendarData.syncMetadata.lastSyncTimestamp = nowMs;
+    store.calendarData.syncMetadata.lastSuccessfulSyncTime = new Date().toISOString();
+    store.calendarData.syncMetadata.status = 'connected';
+    store.calendarData.syncMetadata.eventsStoredCount = allStoredEvents.length;
+    store.calendarData.syncMetadata.upcomingEventsCount = upcomingEvents.length;
+    if (errors.length > 0) {
+      store.calendarData.syncMetadata.errorMessage = errors.join('; ');
+    } else {
+      store.calendarData.syncMetadata.errorMessage = undefined;
+    }
+
+    // 6. Persist to central Firebase RTDB
+    await persistStore({
+      calendarData: store.calendarData,
+      snapshots: store.snapshots,
+    });
+
+    // 7. Format activities and Up Next from database
+    const { activities, scheduleGapNote, nearestUpcomingEvent } = buildCalendarActivitiesFromStore(
+      allStoredEvents,
+      timeZone
+    );
+
+    const upNext = nearestUpcomingEvent ? formatCalendarUpNext(nearestUpcomingEvent, timeZone) : null;
+
+    console.log(
+      `[Calendar Sync Success] Account: ${accountEmail || 'primary'}, Discovered: ${discoveredCalendars.length} calendars, Fetched: ${totalFetchedCount}, Stored: ${allStoredEvents.length}, Upcoming: ${upcomingEvents.length}, Nearest: ${nearestUpcomingEvent?.summary || 'none'}`
+    );
+
+    return res.status(200).json({
+      success: true,
+      accountEmail,
+      calendarsDiscovered: discoveredCalendars,
+      eventsStoredCount: allStoredEvents.length,
+      upcomingEventsCount: upcomingEvents.length,
+      nearestUpcomingEvent,
+      upNext,
+      activities,
+      count: activities.length,
+      scheduleGapNote,
+      syncMetadata: store.calendarData.syncMetadata,
+      syncDurationMs: Date.now() - syncStartTime,
+    });
+  } catch (error: any) {
+    console.error('Error syncing Google Calendar:', error);
+    try {
+      const store = await getStore();
+      if (store.calendarData?.syncMetadata) {
+        store.calendarData.syncMetadata.status = 'failed';
+        store.calendarData.syncMetadata.errorMessage = error.message;
+        await persistStore({ calendarData: store.calendarData });
+      }
+    } catch {}
+    return res.status(500).json({
+      success: false,
+      error: error.message || 'Internal Calendar Sync Error',
+    });
+  }
+});
+
+// GET /api/calendar/up-next
+// Queries the central database for the chronologically nearest upcoming event across all connected calendars
+app.get('/api/calendar/up-next', async (req: Request, res: Response) => {
+  try {
+    const timeZone = (req.query.timeZone as string) || 'Asia/Tokyo';
+    const store = await getStore();
+    const nowMs = Date.now();
+
+    const storedEvents = Object.values(store.calendarData?.events || {});
+    const upcomingEvents = storedEvents
+      .filter((e) => e && e.status !== 'cancelled' && e.endMs > nowMs)
+      .sort((a, b) => a.startMs - b.startMs);
+
+    if (upcomingEvents.length > 0) {
+      const nearest = upcomingEvents[0];
+      const upNext = formatCalendarUpNext(nearest, timeZone);
+      return res.status(200).json({
+        success: true,
+        hasUpcomingEvent: true,
+        upNext,
+        rawEvent: nearest,
+        totalUpcomingCount: upcomingEvents.length,
+        syncMetadata: store.calendarData?.syncMetadata,
       });
-    const nextUpcomingEvent = allUpcoming[0] || null;
+    }
+
+    return res.status(200).json({
+      success: true,
+      hasUpcomingEvent: false,
+      upNext: null,
+      rawEvent: null,
+      totalUpcomingCount: 0,
+      syncMetadata: store.calendarData?.syncMetadata,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/calendar/events
+// Returns calendar activities from the central database (7-day timeline + future schedule)
+app.get('/api/calendar/events', async (req: Request, res: Response) => {
+  try {
+    const timeZone = (req.query.timeZone as string) || 'Asia/Tokyo';
+    const store = await getStore();
+    const storedEvents = Object.values(store.calendarData?.events || {});
+
+    const { activities, scheduleGapNote, nearestUpcomingEvent } = buildCalendarActivitiesFromStore(
+      storedEvents,
+      timeZone
+    );
+    const upNext = nearestUpcomingEvent ? formatCalendarUpNext(nearestUpcomingEvent, timeZone) : null;
 
     return res.status(200).json({
       success: true,
       activities,
       count: activities.length,
-      nextUpcomingEvent,
+      nearestUpcomingEvent,
+      upNext,
       scheduleGapNote,
-      window: { todayKey, tomorrowKey, timeZone },
+      syncMetadata: store.calendarData?.syncMetadata,
     });
-  } catch (error: any) {
-    console.error('Error syncing Google Calendar:', error);
-    return res.status(500).json({
-      success: false,
-      error: error.message || 'Internal Calendar Sync Error',
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/calendar/diagnostics
+// Provides comprehensive diagnostics on calendar account, tokens, sync status, and stored events
+app.get('/api/calendar/diagnostics', async (_req: Request, res: Response) => {
+  try {
+    const store = await getStore();
+    const nowMs = Date.now();
+    const storedEvents = Object.values(store.calendarData?.events || {});
+    const upcomingEvents = storedEvents
+      .filter((e) => e && e.status !== 'cancelled' && e.endMs > nowMs)
+      .sort((a, b) => a.startMs - b.startMs);
+
+    return res.status(200).json({
+      success: true,
+      status: store.calendarData?.syncMetadata?.status || 'idle',
+      lastSyncTimestamp: store.calendarData?.syncMetadata?.lastSyncTimestamp || 0,
+      lastSuccessfulSyncTime: store.calendarData?.syncMetadata?.lastSuccessfulSyncTime || null,
+      accountEmail: store.calendarData?.syncMetadata?.accountEmail || null,
+      calendarsDiscovered: store.calendarData?.syncMetadata?.calendarsDiscovered || [],
+      eventsStoredCount: storedEvents.length,
+      upcomingEventsCount: upcomingEvents.length,
+      nearestUpcomingEvent: upcomingEvents[0] || null,
+      syncTokensCount: Object.keys(store.calendarData?.syncMetadata?.syncTokens || {}).length,
+      errorMessage: store.calendarData?.syncMetadata?.errorMessage || null,
     });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -1746,6 +2150,19 @@ async function buildDiagnosticsReport() {
         status: 'ok',
         httpStatus: 200,
         defaultUserLastChecked: store.userState.default?.last_checked_at || null,
+      },
+      calendar: {
+        endpoint: '/api/calendar/up-next',
+        status: store.calendarData?.syncMetadata?.status === 'failed' ? 'error' : 'ok',
+        httpStatus: 200,
+        syncStatus: store.calendarData?.syncMetadata?.status || 'idle',
+        lastSuccessfulSyncTime: store.calendarData?.syncMetadata?.lastSuccessfulSyncTime || null,
+        accountEmail: store.calendarData?.syncMetadata?.accountEmail || null,
+        calendarsCount: store.calendarData?.syncMetadata?.calendarsDiscovered?.length || 0,
+        storedEventsCount: Object.keys(store.calendarData?.events || {}).length,
+        upcomingEventsCount: Object.values(store.calendarData?.events || {}).filter(
+          (e) => e.status !== 'cancelled' && e.endMs > now.getTime()
+        ).length,
       },
     },
   };

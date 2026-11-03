@@ -29,6 +29,8 @@ import {
   markUserChecked,
   fetchWeeklyRecap,
   mergeAndSortActivities,
+  fetchCalendarDatabaseEvents,
+  fetchCalendarUpNext,
 } from './services/api';
 import {
   initAuth,
@@ -155,6 +157,21 @@ export default function App() {
     }
   }, []);
 
+  // 3B. Load Calendar Data from Central Database
+  const loadCalendarFromDatabase = useCallback(async (tz: string) => {
+    try {
+      const res = await fetchCalendarDatabaseEvents(tz);
+      if (res && res.activities && res.activities.length > 0) {
+        setCalendarActivities(res.activities);
+        if (res.scheduleGapNote) setScheduleGapNote(res.scheduleGapNote);
+      }
+      return res;
+    } catch (err) {
+      console.warn('Failed to load calendar events from central database:', err);
+      return null;
+    }
+  }, []);
+
   // 4. Load Google Calendar, Classroom & Gmail across all connected accounts
   const loadGoogleData = useCallback(async (token: string, tz: string) => {
     try {
@@ -175,7 +192,7 @@ export default function App() {
           if (!acc.accessToken) return;
           try {
             const [calResult, classResult, gmailResult] = await Promise.all([
-              syncGoogleCalendar(acc.accessToken, { timeZone: tz }).catch((e: any) => {
+              syncGoogleCalendar(acc.accessToken, { timeZone: tz, accountEmail: acc.email }).catch((e: any) => {
                 if (e?.message?.includes('401')) {
                   markAccountTokenExpired(acc.email, true);
                 }
@@ -195,7 +212,9 @@ export default function App() {
               }),
             ]);
 
-            if (calResult.activities) allCalActs.push(...calResult.activities);
+            if (calResult.activities && calResult.activities.length > 0) {
+              allCalActs.push(...calResult.activities);
+            }
             if (calResult.scheduleGapNote) latestGapNote = calResult.scheduleGapNote;
             if (classResult.activities) allClassActs.push(...classResult.activities);
             if (classResult.assignments) allAssignments.push(...classResult.assignments);
@@ -208,10 +227,15 @@ export default function App() {
       );
 
       // Deduplicate calendar activities by id
-      const uniqueCalMap = new Map<string, KairoActivity>();
-      for (const act of allCalActs) uniqueCalMap.set(act.id, act);
-      setCalendarActivities(Array.from(uniqueCalMap.values()));
-      setScheduleGapNote(latestGapNote);
+      if (allCalActs.length > 0) {
+        const uniqueCalMap = new Map<string, KairoActivity>();
+        for (const act of allCalActs) uniqueCalMap.set(act.id, act);
+        setCalendarActivities(Array.from(uniqueCalMap.values()));
+      } else {
+        // Fall back to reading persisted database events
+        await loadCalendarFromDatabase(tz);
+      }
+      if (latestGapNote) setScheduleGapNote(latestGapNote);
 
       // Deduplicate classroom assignments by id
       const uniqueAssnMap = new Map<string, ClassroomAssignment>();
@@ -240,7 +264,7 @@ export default function App() {
       setHasGoogleToken(false);
       return null;
     }
-  }, []);
+  }, [loadCalendarFromDatabase]);
 
   // 5. Load Personal Reminders & Travel Plans
   const loadRemindersData = useCallback(async (userId?: string) => {
@@ -275,6 +299,7 @@ export default function App() {
         loadRemindersData(user?.uid),
         loadSinceLastChecked(user?.uid),
         loadWeeklyRecap(timeZone),
+        loadCalendarFromDatabase(timeZone),
       ]);
       const token = getAccessToken();
       if (token) {
@@ -287,6 +312,7 @@ export default function App() {
     loadSpendIqData,
     loadStockData,
     loadGoogleData,
+    loadCalendarFromDatabase,
     loadRemindersData,
     loadSinceLastChecked,
     loadWeeklyRecap,
@@ -321,9 +347,6 @@ export default function App() {
         if (!mounted) return;
         setUser(null);
         setHasGoogleToken(false);
-        setCalendarActivities([]);
-        setClassroomActivities([]);
-        setClassroomAssignments([]);
       }
     );
 
@@ -333,6 +356,7 @@ export default function App() {
       loadRemindersData(),
       loadSinceLastChecked(),
       loadWeeklyRecap(timeZone),
+      loadCalendarFromDatabase(timeZone),
     ]).finally(() => {
       if (mounted) setIsInitialLoading(false);
     });
@@ -345,12 +369,34 @@ export default function App() {
     loadSpendIqData,
     loadStockData,
     loadGoogleData,
+    loadCalendarFromDatabase,
     loadRemindersData,
     loadSinceLastChecked,
     loadWeeklyRecap,
     timeZone,
     showAllSpenders,
   ]);
+
+  // Automatic refresh when returning to tab if stale (> 5 minutes)
+  useEffect(() => {
+    let lastActiveSync = Date.now();
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        const now = Date.now();
+        if (now - lastActiveSync > 5 * 60 * 1000) {
+          lastActiveSync = now;
+          const token = getAccessToken();
+          if (token) {
+            loadGoogleData(token, timeZone);
+          } else {
+            loadCalendarFromDatabase(timeZone);
+          }
+        }
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, [timeZone, loadGoogleData, loadCalendarFromDatabase]);
 
   // Connect Google Account (supports linking with existing GitHub session)
   const handleConnectGoogle = async (options?: { forceDirectSignIn?: boolean }) => {

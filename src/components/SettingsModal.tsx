@@ -28,6 +28,7 @@ import {
   connectAdditionalGoogleAccount,
   ConnectedGoogleAccount,
 } from '../services/auth';
+import { fetchCalendarDiagnostics } from '../services/api';
 import { USER_PORTFOLIO_HOLDINGS, TOTAL_PORTFOLIO_COST_BASIS } from '../services/stockService';
 
 interface SettingsModalProps {
@@ -103,10 +104,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [googleAccounts, setGoogleAccounts] = React.useState<ConnectedGoogleAccount[]>(() =>
     getConnectedGoogleAccounts()
   );
+  const [calendarDiag, setCalendarDiag] = React.useState<any>(null);
 
   React.useEffect(() => {
     if (isOpen) {
       setGoogleAccounts(getConnectedGoogleAccounts());
+      fetchCalendarDiagnostics().then((d) => {
+        if (d) setCalendarDiag(d);
+      });
     }
   }, [isOpen]);
 
@@ -517,6 +522,53 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   </div>
                 )}
 
+                {/* Calendar Synchronization Status Badge */}
+                {calendarDiag && (calendarDiag.lastSuccessfulSyncTime || calendarDiag.status !== 'idle') && (
+                  <div className="p-2.5 bg-white dark:bg-[#2C2C2E] rounded-xl border border-black/[0.04] dark:border-white/[0.06] flex items-center justify-between text-[11px]">
+                    <div className="flex items-center gap-2">
+                      <span
+                        className={`w-2 h-2 rounded-full shrink-0 ${
+                          isSyncing || calendarDiag.status === 'syncing'
+                            ? 'bg-blue-500 animate-pulse'
+                            : calendarDiag.status === 'failed'
+                            ? 'bg-amber-500'
+                            : 'bg-emerald-500'
+                        }`}
+                      />
+                      <span className="font-semibold text-neutral-800 dark:text-neutral-200">
+                        {isSyncing || calendarDiag.status === 'syncing'
+                          ? 'Syncing…'
+                          : calendarDiag.status === 'failed'
+                          ? 'Sync failed'
+                          : 'Calendar Connected'}
+                      </span>
+                      {calendarDiag.calendarsDiscovered?.length > 0 && (
+                        <span className="text-neutral-500 dark:text-neutral-400 truncate">
+                          · {calendarDiag.calendarsDiscovered.length} {calendarDiag.calendarsDiscovered.length === 1 ? 'calendar' : 'calendars'}
+                        </span>
+                      )}
+                      {calendarDiag.upcomingEventsCount !== undefined && (
+                        <span className="text-neutral-500 dark:text-neutral-400 truncate">
+                          · {calendarDiag.upcomingEventsCount} upcoming
+                        </span>
+                      )}
+                    </div>
+                    {calendarDiag.lastSuccessfulSyncTime && (
+                      <span className="text-neutral-500 dark:text-neutral-400 shrink-0">
+                        Last synced{' '}
+                        {new Intl.DateTimeFormat('en-US', {
+                          timeZone,
+                          month: 'short',
+                          day: 'numeric',
+                          hour: 'numeric',
+                          minute: '2-digit',
+                          hour12: true,
+                        }).format(new Date(calendarDiag.lastSuccessfulSyncTime))}
+                      </span>
+                    )}
+                  </div>
+                )}
+
                 {/* GitHub Account */}
                 <div className="p-3 bg-white dark:bg-[#2C2C2E] rounded-xl border border-black/[0.04] dark:border-white/[0.06]">
                   <div className="flex items-center justify-between gap-2">
@@ -662,6 +714,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             <span>Since Last Checked:</span>
                             <span className="text-emerald-600 dark:text-emerald-400 font-semibold">HTTP 200 Ready</span>
                           </div>
+
+                          {diagnostics.apis?.calendar && (
+                            <div className="flex justify-between text-neutral-600 dark:text-neutral-400">
+                              <span>Calendar Sync:</span>
+                              <span className="text-neutral-900 dark:text-neutral-200">
+                                {diagnostics.apis.calendar.syncStatus || 'ok'} · {diagnostics.apis.calendar.upcomingEventsCount ?? 0} upcoming · {diagnostics.apis.calendar.storedEventsCount ?? 0} stored
+                              </span>
+                            </div>
+                          )}
                         </div>
 
                         {/* Data Sources */}

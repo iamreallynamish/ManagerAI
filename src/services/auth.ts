@@ -39,6 +39,7 @@ const GOOGLE_TOKEN_STORAGE_KEY = 'kairo_google_access_token';
 
 // Configure Google Provider
 const googleProvider = new GoogleAuthProvider();
+googleProvider.addScope('https://www.googleapis.com/auth/calendar.readonly');
 googleProvider.addScope('https://www.googleapis.com/auth/calendar.events.readonly');
 googleProvider.addScope('https://www.googleapis.com/auth/classroom.courses.readonly');
 googleProvider.addScope('https://www.googleapis.com/auth/classroom.coursework.me.readonly');
@@ -348,6 +349,7 @@ export const googleSignIn = async (options?: { forceDirectSignIn?: boolean }): P
 export const connectAdditionalGoogleAccount = async (): Promise<ConnectedGoogleAccount | null> => {
   try {
     const provider = new GoogleAuthProvider();
+    provider.addScope('https://www.googleapis.com/auth/calendar.readonly');
     provider.addScope('https://www.googleapis.com/auth/calendar.events.readonly');
     provider.addScope('https://www.googleapis.com/auth/classroom.courses.readonly');
     provider.addScope('https://www.googleapis.com/auth/classroom.coursework.me.readonly');

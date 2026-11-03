@@ -19,9 +19,10 @@ export interface BriefingResult {
 function cleanCalendarTitle(raw: string): string {
   if (!raw) return 'Scheduled commitment';
   return raw
-    .replace(/^(Your next class is\s*|Your next event is\s*|You have\s*|Tomorrow, you have\s*|Tomorrow at [^:]+:\s*|In \d+ days:\s*)/i, '')
+    .replace(/^(Your next class is\s*|Your next event is\s*|You have\s*|Tomorrow, you have\s*|Tomorrow:\s*|Tomorrow at [^:]+:\s*|In \d+ days:\s*)/i, '')
     .replace(/\s+at\s+\d{1,2}:\d{2}\s*[AP]M(\s+today)?\.?/i, '')
     .replace(/\(All day\)/i, '')
+    .replace(/\(Completed\)/i, '')
     .trim();
 }
 
@@ -97,9 +98,13 @@ export function synthesizeBriefing(options: {
 
   const greeting = `${timeGreeting}, ${userName}.`;
 
-  // 2. Filter genuinely future calendar events across all horizons
+  // 2. Filter genuinely future calendar events across all horizons (not yet ended)
   const futureCalendarEvents = calendarActivities
-    .filter((act) => act.activityType === 'calendar_event' && act.occurredAt > nowMs)
+    .filter(
+      (act) =>
+        act.activityType === 'calendar_event' &&
+        ((act.endAt && act.endAt > nowMs) || act.occurredAt > nowMs)
+    )
     .sort((a, b) => a.occurredAt - b.occurredAt);
 
   const todayEvents = calendarActivities
