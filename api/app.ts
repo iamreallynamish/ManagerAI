@@ -15,6 +15,7 @@ import {
   getNseMarketStatus,
   validateMarketQuote,
 } from '../src/services/stockService.js';
+import { scoreEmailMessage } from '../src/services/emailIntelligence.js';
 
 import spendiqFallback from '../src/data/spendiq_fallback.json';
 
@@ -136,14 +137,31 @@ async function getStore(): Promise<KairoStore> {
     if (res.ok) {
       const cloudData = await res.json();
       if (cloudData && typeof cloudData === 'object') {
+        const loadedReminders = Array.isArray(cloudData.reminders)
+          ? cloudData.reminders
+          : Object.values(cloudData.reminders || {});
+
+        // Strict truth enforcement: India flights are NOT booked unless explicitly confirmed
+        for (const r of loadedReminders) {
+          if (r && r.id === 'rem_india_flights') {
+            if (r.details?.includes('Flights confirmed') || r.details?.includes('Flights booked') || r.details?.includes('India flights are booked') || r.completed) {
+              r.status = 'active';
+              r.completed = false;
+              r.flights_booked = false;
+              r.completed_at = null;
+              r.details = 'Target booking window: Nov 8–21 · Outbound Jan 5, 2027, Return Apr 5, 2027';
+              r.context = r.details;
+              r.title = 'Book India flights';
+            }
+          }
+        }
+
         memoryStore = {
           ...DEFAULT_STORE,
           ...cloudData,
           userState: { ...DEFAULT_STORE.userState, ...(cloudData.userState || {}) },
           portfolio: cloudData.portfolio?.holdings?.length ? cloudData.portfolio : DEFAULT_STORE.portfolio,
-          reminders: Array.isArray(cloudData.reminders)
-            ? cloudData.reminders
-            : Object.values(cloudData.reminders || {}),
+          reminders: loadedReminders.length > 0 ? loadedReminders : DEFAULT_STORE.reminders,
           snapshots: { ...DEFAULT_STORE.snapshots, ...(cloudData.snapshots || {}) },
         };
         storeLoaded = true;
@@ -379,13 +397,16 @@ app.post('/api/reminders/:id/flights-booked', async (req: Request, res: Response
       return res.status(404).json({ success: false, error: 'Reminder not found' });
     }
 
+    target.status = 'completed';
+    target.completed = true;
+    target.completed_at = Date.now();
     target.flights_booked = true;
-    target.details = 'Flights confirmed! Outbound Jan 5, 2027 · Return Apr 5, 2027. Next: packing & travel checklist.';
+    target.details = 'Flights booked. Trip dates: January 5, 2027 – April 5, 2027.';
     target.context = target.details;
     target.updated_at = Date.now();
 
     await persistStore({ reminders: store.reminders });
-    return res.status(200).json({ success: true, reminder: target });
+    return res.status(200).json({ success: true, reminder: target, reminders: store.reminders });
   } catch (err: any) {
     return res.status(500).json({ success: false, error: err.message });
   }
@@ -860,9 +881,11 @@ app.post('/api/calendar/sync', async (req: Request, res: Response) => {
     const todayKey = getDateKey(now, timeZone);
     const tomorrowDate = new Date(now.getTime() + 86400000);
     const tomorrowKey = getDateKey(tomorrowDate, timeZone);
+    const nowMs = now.getTime();
+    const sevenDaysAgoMs = nowMs - 7 * 86400000;
 
-    const timeMin = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
-    const timeMax = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString();
+    const timeMin = new Date(sevenDaysAgoMs).toISOString();
+    const timeMax = new Date(nowMs + 60 * 24 * 60 * 60 * 1000).toISOString();
 
     const calendarUrl = `https://www.googleapis.com/calendar/v3/calendars/primary/events?singleEvents=true&orderBy=startTime&timeMin=${encodeURIComponent(
       timeMin
@@ -884,6 +907,7 @@ app.post('/api/calendar/sync', async (req: Request, res: Response) => {
     const gData = await gRes.json();
     const items = gData.items || [];
 
+    const pastItems: any[] = [];
     const todayItems: any[] = [];
     const tomorrowItems: any[] = [];
     const futureItems: any[] = [];
@@ -898,13 +922,18 @@ app.post('/api/calendar/sync', async (req: Request, res: Response) => {
       if (!startTimeStr) continue;
 
       const eventDate = new Date(startTimeStr);
+      const eventTimeMs = eventDate.getTime();
       const eventDateKey = getDateKey(eventDate, timeZone);
 
-      if (eventDateKey === todayKey) {
+      if (eventTimeMs < nowMs) {
+        if (eventTimeMs >= sevenDaysAgoMs) {
+          pastItems.push(item);
+        }
+      } else if (eventDateKey === todayKey) {
         todayItems.push(item);
       } else if (eventDateKey === tomorrowKey) {
         tomorrowItems.push(item);
-      } else if (eventDate.getTime() > tomorrowDate.getTime()) {
+      } else {
         futureItems.push(item);
       }
     }
@@ -928,7 +957,41 @@ app.post('/api/calendar/sync', async (req: Request, res: Response) => {
     });
 
     const activities: KairoActivity[] = [];
-    const nowMs = now.getTime();
+
+    pastItems.sort((a, b) => {
+      const ta = new Date(a.start?.dateTime || a.start?.date).getTime();
+      const tb = new Date(b.start?.dateTime || b.start?.date).getTime();
+      return tb - ta;
+    });
+
+    for (const item of pastItems) {
+      const startTimeStr = item.start?.dateTime || item.start?.date;
+      const isAllDay = !item.start?.dateTime;
+      const occurredAt = new Date(startTimeStr).getTime();
+      const endAt = item.end?.dateTime || item.end?.date ? new Date(item.end?.dateTime || item.end?.date).getTime() : undefined;
+      const { dateKey, dateHeader, timeString } = formatDateTime(occurredAt, timeZone);
+      const summary = item.summary || 'Scheduled commitment';
+
+      const detailParts: string[] = [];
+      if (item.location) detailParts.push(item.location);
+      if (item.hangoutLink) detailParts.push('Google Meet');
+
+      activities.push({
+        id: `cal_past_${item.id}`,
+        source: 'calendar',
+        activityType: 'calendar_event',
+        title: isAllDay ? `${summary} (Completed)` : `Scheduled event completed: ${summary}`,
+        detail: detailParts.length > 0 ? detailParts.join(' · ') : undefined,
+        relatedEntityId: item.id,
+        occurredAt,
+        endAt,
+        allDay: isAllDay,
+        link: item.htmlLink,
+        dateKey,
+        dateHeader,
+        timeString: isAllDay ? 'All day' : timeString,
+      });
+    }
 
     let scheduleGapNote: string | undefined;
     if (todayItems.length > 0) {
@@ -1173,10 +1236,21 @@ app.post('/api/calendar/sync', async (req: Request, res: Response) => {
 
     persistStore({ snapshots: store.snapshots }).catch(() => {});
 
+    // Compute chronologically nearest upcoming event across all horizons
+    const allUpcoming = [...todayItems, ...tomorrowItems, ...futureItems]
+      .filter((item) => new Date(item.start?.dateTime || item.start?.date).getTime() > nowMs)
+      .sort((a, b) => {
+        const ta = new Date(a.start?.dateTime || a.start?.date).getTime();
+        const tb = new Date(b.start?.dateTime || b.start?.date).getTime();
+        return ta - tb;
+      });
+    const nextUpcomingEvent = allUpcoming[0] || null;
+
     return res.status(200).json({
       success: true,
       activities,
       count: activities.length,
+      nextUpcomingEvent,
       scheduleGapNote,
       window: { todayKey, tomorrowKey, timeZone },
     });
@@ -1185,6 +1259,114 @@ app.post('/api/calendar/sync', async (req: Request, res: Response) => {
     return res.status(500).json({
       success: false,
       error: error.message || 'Internal Calendar Sync Error',
+    });
+  }
+});
+
+// --- 5B. GMAIL INTELLIGENCE SERVICE ---
+app.post('/api/gmail/sync', async (req: Request, res: Response) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({
+        success: false,
+        error: 'Missing or invalid Authorization Bearer header',
+      });
+    }
+
+    const accessToken = authHeader.split(' ')[1];
+    const timeZone = (req.body.timeZone as string) || 'Asia/Tokyo';
+    const accountEmail = (req.body.accountEmail as string) || 'primary';
+
+    // Query messages from the last 7 days window
+    const listUrl = 'https://gmail.googleapis.com/gmail/v1/users/me/messages?q=newer_than:7d&maxResults=20';
+    const gRes = await fetch(listUrl, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+
+    if (!gRes.ok) {
+      const errText = await gRes.text();
+      return res.status(gRes.status).json({
+        success: false,
+        error: `Gmail API error: ${gRes.statusText}`,
+        details: errText,
+      });
+    }
+
+    const gData = await gRes.json();
+    const messageRefs = gData.messages || [];
+
+    const scoredInsights: any[] = [];
+    const activities: KairoActivity[] = [];
+
+    // Concurrently fetch metadata for top messages
+    const fetchDetails = messageRefs.slice(0, 15).map(async (ref: { id: string }) => {
+      try {
+        const msgUrl = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${ref.id}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date`;
+        const mRes = await fetch(msgUrl, {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        });
+        if (!mRes.ok) return null;
+        const mData = await mRes.json();
+        const headers = mData.payload?.headers || [];
+        const subject = headers.find((h: any) => h.name?.toLowerCase() === 'subject')?.value || '(No Subject)';
+        const from = headers.find((h: any) => h.name?.toLowerCase() === 'from')?.value || '';
+        const snippet = mData.snippet || '';
+        const internalDateMs = parseInt(mData.internalDate, 10) || Date.now();
+        const labels = mData.labelIds || [];
+
+        return {
+          id: mData.id,
+          threadId: mData.threadId,
+          sender: from,
+          senderEmail: from,
+          subject,
+          snippet,
+          internalDateMs,
+          labels,
+        };
+      } catch {
+        return null;
+      }
+    });
+
+    const rawMessages = (await Promise.all(fetchDetails)).filter(Boolean);
+
+    for (const msg of rawMessages) {
+      if (!msg) continue;
+      const scored = scoreEmailMessage(msg, accountEmail);
+      if (scored.isHighPriority) {
+        scoredInsights.push(scored);
+
+        const { dateKey, dateHeader, timeString } = formatDateTime(msg.internalDateMs, timeZone);
+        activities.push({
+          id: `email_${msg.id}`,
+          source: 'email',
+          activityType: 'email_alert',
+          title: `Important: ${msg.subject}`,
+          detail: scored.summary || msg.snippet,
+          relatedEntityId: msg.id,
+          occurredAt: msg.internalDateMs,
+          dateKey,
+          dateHeader,
+          timeString,
+          urgency: 'today',
+        });
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      insights: scoredInsights,
+      activities,
+      accountEmail,
+      count: scoredInsights.length,
+    });
+  } catch (error: any) {
+    console.error('Error syncing Gmail:', error);
+    return res.status(500).json({
+      success: false,
+      error: error.message || 'Internal Gmail Sync Error',
     });
   }
 });

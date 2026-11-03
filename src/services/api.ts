@@ -11,6 +11,7 @@ import {
   ReminderStatus,
   PortfolioHolding,
 } from '../types/activity';
+import { ScoredEmailInsight } from './emailIntelligence';
 
 export interface FetchTransactionsOptions {
   timeZone?: string;
@@ -304,6 +305,47 @@ export async function syncGoogleClassroom(
     assignments: data.assignments || [],
     activities: data.activities || [],
   };
+}
+
+export interface SyncGmailOptions {
+  timeZone?: string;
+  accountEmail?: string;
+}
+
+export interface SyncGmailResult {
+  insights: ScoredEmailInsight[];
+  activities: KairoActivity[];
+}
+
+export async function syncGmail(
+  accessToken: string,
+  options: SyncGmailOptions = {}
+): Promise<SyncGmailResult> {
+  try {
+    const res = await fetch('/api/gmail/sync', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify(options),
+    });
+
+    if (!res.ok) {
+      const errorData = await res.json().catch(() => ({}));
+      console.warn('Gmail sync returned:', res.status, errorData);
+      return { insights: [], activities: [] };
+    }
+
+    const data = await res.json();
+    return {
+      insights: data.insights || [],
+      activities: data.activities || [],
+    };
+  } catch (err) {
+    console.warn('Failed to sync Gmail:', err);
+    return { insights: [], activities: [] };
+  }
 }
 
 // --- Stock Watchlist ---

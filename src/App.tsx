@@ -17,11 +17,13 @@ import {
   PersonalReminder,
   SinceLastCheckedItem,
   WeeklyRecapData,
+  StockQuote,
 } from './types/activity';
 import {
   fetchSpendIqActivities,
   syncGoogleCalendar,
   syncGoogleClassroom,
+  syncGmail,
   fetchStockWatchlist,
   fetchSinceLastChecked,
   markUserChecked,
@@ -36,6 +38,8 @@ import {
   disconnectGithub,
   logout,
   getAccessToken,
+  getConnectedGoogleAccounts,
+  markAccountTokenExpired,
 } from './services/auth';
 import {
   getReminders,
@@ -45,6 +49,7 @@ import {
   deleteReminder,
 } from './services/reminders';
 import { synthesizeBriefing } from './services/briefingEngine';
+import { ScoredEmailInsight } from './services/emailIntelligence';
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
@@ -56,6 +61,9 @@ export default function App() {
   const [classroomActivities, setClassroomActivities] = useState<KairoActivity[]>([]);
   const [classroomAssignments, setClassroomAssignments] = useState<ClassroomAssignment[]>([]);
   const [stockActivities, setStockActivities] = useState<KairoActivity[]>([]);
+  const [stockQuotes, setStockQuotes] = useState<StockQuote[]>([]);
+  const [emailActivities, setEmailActivities] = useState<KairoActivity[]>([]);
+  const [emailInsights, setEmailInsights] = useState<ScoredEmailInsight[]>([]);
   const [reminders, setReminders] = useState<PersonalReminder[]>([]);
 
   // Awareness state
@@ -123,8 +131,9 @@ export default function App() {
   // 2. Load Stock Watchlist (meaningful moves >= ±3%)
   const loadStockData = useCallback(async (tz: string) => {
     try {
-      const { activities } = await fetchStockWatchlist(tz);
+      const { quotes, activities } = await fetchStockWatchlist(tz);
       setStockActivities(activities);
+      setStockQuotes(quotes);
       return activities;
     } catch (err) {
       console.warn('Failed to load stock data:', err);
@@ -146,31 +155,88 @@ export default function App() {
     }
   }, []);
 
-  // 4. Load Google Calendar & Classroom data
+  // 4. Load Google Calendar, Classroom & Gmail across all connected accounts
   const loadGoogleData = useCallback(async (token: string, tz: string) => {
     try {
-      const [calResult, classResult] = await Promise.all([
-        syncGoogleCalendar(token, { timeZone: tz }).catch((e) => {
-          console.warn('Calendar sync error:', e);
-          return { activities: [], scheduleGapNote: undefined };
-        }),
-        syncGoogleClassroom(token, { timeZone: tz }).catch((e) => {
-          console.warn('Classroom sync error:', e);
-          return { assignments: [], activities: [] };
-        }),
-      ]);
+      const storedAccounts = getConnectedGoogleAccounts();
+      const accountsToSync = storedAccounts.length > 0
+        ? storedAccounts
+        : [{ email: 'primary', accessToken: token, id: 'primary', name: 'Primary Account', connectedAt: Date.now() }];
 
-      setCalendarActivities(calResult.activities);
-      setScheduleGapNote(calResult.scheduleGapNote);
-      setClassroomActivities(classResult.activities);
-      setClassroomAssignments(classResult.assignments);
+      const allCalActs: KairoActivity[] = [];
+      const allClassActs: KairoActivity[] = [];
+      const allAssignments: ClassroomAssignment[] = [];
+      const allEmailActs: KairoActivity[] = [];
+      const allEmailInsights: ScoredEmailInsight[] = [];
+      let latestGapNote: string | undefined = undefined;
+
+      await Promise.all(
+        accountsToSync.map(async (acc) => {
+          if (!acc.accessToken) return;
+          try {
+            const [calResult, classResult, gmailResult] = await Promise.all([
+              syncGoogleCalendar(acc.accessToken, { timeZone: tz }).catch((e: any) => {
+                if (e?.message?.includes('401')) {
+                  markAccountTokenExpired(acc.email, true);
+                }
+                return { activities: [], scheduleGapNote: undefined };
+              }),
+              syncGoogleClassroom(acc.accessToken, { timeZone: tz }).catch((e: any) => {
+                if (e?.message?.includes('401')) {
+                  markAccountTokenExpired(acc.email, true);
+                }
+                return { assignments: [], activities: [] };
+              }),
+              syncGmail(acc.accessToken, { timeZone: tz, accountEmail: acc.email }).catch((e: any) => {
+                if (e?.message?.includes('401')) {
+                  markAccountTokenExpired(acc.email, true);
+                }
+                return { insights: [], activities: [] };
+              }),
+            ]);
+
+            if (calResult.activities) allCalActs.push(...calResult.activities);
+            if (calResult.scheduleGapNote) latestGapNote = calResult.scheduleGapNote;
+            if (classResult.activities) allClassActs.push(...classResult.activities);
+            if (classResult.assignments) allAssignments.push(...classResult.assignments);
+            if (gmailResult.activities) allEmailActs.push(...gmailResult.activities);
+            if (gmailResult.insights) allEmailInsights.push(...gmailResult.insights);
+          } catch (accErr) {
+            console.warn(`Sync error for account ${acc.email}:`, accErr);
+          }
+        })
+      );
+
+      // Deduplicate calendar activities by id
+      const uniqueCalMap = new Map<string, KairoActivity>();
+      for (const act of allCalActs) uniqueCalMap.set(act.id, act);
+      setCalendarActivities(Array.from(uniqueCalMap.values()));
+      setScheduleGapNote(latestGapNote);
+
+      // Deduplicate classroom assignments by id
+      const uniqueAssnMap = new Map<string, ClassroomAssignment>();
+      for (const assn of allAssignments) uniqueAssnMap.set(assn.id, assn);
+      setClassroomAssignments(Array.from(uniqueAssnMap.values()));
+
+      // Deduplicate classroom activities by id
+      const uniqueClassActMap = new Map<string, KairoActivity>();
+      for (const act of allClassActs) uniqueClassActMap.set(act.id, act);
+      setClassroomActivities(Array.from(uniqueClassActMap.values()));
+
+      // Deduplicate email activities by id
+      const uniqueEmailActMap = new Map<string, KairoActivity>();
+      for (const act of allEmailActs) uniqueEmailActMap.set(act.id, act);
+      setEmailActivities(Array.from(uniqueEmailActMap.values()));
+
+      // Deduplicate email insights
+      const uniqueInsightMap = new Map<string, ScoredEmailInsight>();
+      for (const ins of allEmailInsights) uniqueInsightMap.set(ins.id, ins);
+      setEmailInsights(Array.from(uniqueInsightMap.values()));
+
       setHasGoogleToken(true);
-      return { calResult, classResult };
+      return true;
     } catch (err: any) {
       console.warn('Failed to sync Google accounts:', err);
-      setCalendarActivities([]);
-      setClassroomActivities([]);
-      setClassroomAssignments([]);
       setHasGoogleToken(false);
       return null;
     }
@@ -454,6 +520,8 @@ export default function App() {
       assignments: classroomAssignments,
       reminders,
       scheduleGapNote,
+      emailInsights,
+      recentStockMoves: stockQuotes,
       todaySpendingContext: spendingContext,
     });
   }, [
@@ -463,24 +531,77 @@ export default function App() {
     classroomAssignments,
     reminders,
     scheduleGapNote,
+    emailInsights,
+    stockQuotes,
     spendingContext,
   ]);
 
-  // 2. Merge and sort all activities
+  // Reminders activities for timeline in rolling 7-day window
+  const reminderActivities = useMemo(() => {
+    const acts: KairoActivity[] = [];
+    const nowMs = Date.now();
+    const sevenDaysAgoMs = nowMs - 7 * 86400000;
+    for (const rem of reminders) {
+      const occurredAt = rem.completed_at || rem.updated_at || rem.created_at;
+      if (occurredAt >= sevenDaysAgoMs) {
+        const d = new Date(occurredAt);
+        const dateKey = d.toISOString().split('T')[0];
+        const isCompleted = rem.status === 'completed' || rem.completed;
+        acts.push({
+          id: `rem_act_${rem.id}`,
+          source: 'reminder',
+          activityType: 'reminder',
+          title: isCompleted ? `Completed: ${rem.title}` : `Active plan: ${rem.title}`,
+          detail: rem.details || rem.context,
+          relatedEntityId: rem.id,
+          occurredAt,
+          dateKey,
+          dateHeader: d
+            .toLocaleDateString('en-US', { timeZone, month: 'short', day: 'numeric', year: 'numeric' })
+            .toUpperCase(),
+          timeString: d.toLocaleTimeString('en-US', { timeZone, hour: 'numeric', minute: '2-digit', hour12: true }),
+        });
+      }
+    }
+    return acts;
+  }, [reminders, timeZone]);
+
+  // 2. Merge and sort all activities across sources
   const allActivities = useMemo(() => {
     return mergeAndSortActivities(
       spendActivities,
       calendarActivities,
       classroomActivities,
-      stockActivities
+      stockActivities,
+      emailActivities,
+      reminderActivities
     );
-  }, [spendActivities, calendarActivities, classroomActivities, stockActivities]);
+  }, [
+    spendActivities,
+    calendarActivities,
+    classroomActivities,
+    stockActivities,
+    emailActivities,
+    reminderActivities,
+  ]);
 
-  // 3. Group all activities by dateHeader, prioritized: TOMORROW (preview) -> TODAY -> YESTERDAY -> Historical
+  // 3. Strict 7-day rolling window: activities from now back to exactly 7 days ago
+  const timelineActivities = useMemo(() => {
+    const nowMs = Date.now();
+    const sevenDaysAgoMs = nowMs - 7 * 86400000;
+    return allActivities.filter((act) => {
+      // Future previews (e.g. TOMORROW) are preserved
+      if (act.occurredAt > nowMs) return true;
+      // Past events are strictly limited to the rolling 7-day window
+      return act.occurredAt >= sevenDaysAgoMs;
+    });
+  }, [allActivities]);
+
+  // 4. Group timeline activities by dateHeader, prioritized: TOMORROW (preview) -> TODAY -> YESTERDAY -> Historical
   const groupedSections = useMemo(() => {
     const groupMap = new Map<string, { dateHeader: string; activities: KairoActivity[] }>();
 
-    for (const act of allActivities) {
+    for (const act of timelineActivities) {
       if (!groupMap.has(act.dateHeader)) {
         groupMap.set(act.dateHeader, { dateHeader: act.dateHeader, activities: [] });
       }
@@ -502,7 +623,7 @@ export default function App() {
     });
 
     return sections;
-  }, [allActivities]);
+  }, [timelineActivities]);
 
   return (
     <div className="min-h-screen bg-[#F2F2F7] dark:bg-black text-neutral-900 dark:text-neutral-100 flex flex-col font-sans antialiased selection:bg-neutral-200 dark:selection:bg-neutral-800">

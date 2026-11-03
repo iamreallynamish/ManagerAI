@@ -4,7 +4,9 @@ import {
   PersonalReminder,
   AttentionItem,
   UpNextItem,
+  StockQuote,
 } from '../types/activity';
+import { ScoredEmailInsight } from './emailIntelligence';
 
 export interface BriefingResult {
   greeting: string;
@@ -50,6 +52,8 @@ export function synthesizeBriefing(options: {
   assignments: ClassroomAssignment[];
   reminders: PersonalReminder[];
   scheduleGapNote?: string;
+  emailInsights?: ScoredEmailInsight[];
+  recentStockMoves?: StockQuote[];
   todaySpendingContext?: {
     todaySpentJpy: number;
     todaySpentInr: number;
@@ -63,6 +67,8 @@ export function synthesizeBriefing(options: {
     assignments,
     reminders,
     scheduleGapNote,
+    emailInsights = [],
+    recentStockMoves = [],
   } = options;
 
   const now = new Date();
@@ -91,7 +97,7 @@ export function synthesizeBriefing(options: {
 
   const greeting = `${timeGreeting}, ${userName}.`;
 
-  // 2. Filter genuinely future calendar events
+  // 2. Filter genuinely future calendar events across all horizons
   const futureCalendarEvents = calendarActivities
     .filter((act) => act.activityType === 'calendar_event' && act.occurredAt > nowMs)
     .sort((a, b) => a.occurredAt - b.occurredAt);
@@ -115,51 +121,29 @@ export function synthesizeBriefing(options: {
   const dueTomorrowAssignments = assignments.filter((a) => a.urgency === 'tomorrow');
 
   // 4. Active personal reminders & Travel context
-  const activeReminders = reminders.filter((r) => r.status === 'active' || (!r.completed && r.status !== 'dismissed'));
-  const travelTrip = reminders.find((r) => r.is_travel || r.title.toLowerCase().includes('flight') || r.title.toLowerCase().includes('india'));
+  // The India flights reminder remains active until explicitly marked completed
+  const activeReminders = reminders.filter(
+    (r) => r.status === 'active' || (!r.completed && r.status !== 'dismissed')
+  );
+  const travelTrip = reminders.find(
+    (r) => r.is_travel || r.title.toLowerCase().includes('flight') || r.title.toLowerCase().includes('india')
+  );
 
   // 5. Intelligent "Up Next" Selection across all horizons
+  // User strict priority order:
+  // 1. The nearest upcoming meaningful Google Calendar event from any connected Google account.
+  // 2. If there is no upcoming calendar event, show the highest-priority active reminder.
+  // 3. If neither exists, show a useful contextual status message.
   let upNext: UpNextItem | null = null;
+  let upNextSourceId: string | null = null;
 
-  const nextCal = futureCalendarEvents[0];
-  const nextAssn = futureAssignments[0];
-
-  // Compare earliest future calendar event vs earliest future assignment
-  if (nextCal && nextAssn) {
-    if (nextCal.occurredAt <= (nextAssn.dueTimestampMs || Infinity)) {
-      const isClass = nextCal.title.toLowerCase().includes('lecture') || nextCal.title.toLowerCase().includes('class');
-      const cleanTitle = cleanCalendarTitle(nextCal.title);
-      const timing = formatRelativeTiming(nextCal.occurredAt, timeZone, nextCal.timeString);
-      const diffDays = Math.ceil((nextCal.occurredAt - nowMs) / 86400000);
-
-      upNext = {
-        id: `upnext_${nextCal.id}`,
-        category: isClass ? 'class' : 'event',
-        headline: cleanTitle,
-        contextTime: timing,
-        detail: nextCal.detail,
-        urgency: diffDays === 0 ? 'now' : diffDays === 1 ? 'tomorrow' : 'soon',
-        link: nextCal.link,
-      };
-    } else {
-      const timing = formatRelativeTiming(nextAssn.dueTimestampMs || nowMs, timeZone, nextAssn.dueTimeString);
-      const diffDays = Math.ceil(((nextAssn.dueTimestampMs || nowMs) - nowMs) / 86400000);
-
-      upNext = {
-        id: `upnext_assn_${nextAssn.id}`,
-        category: 'assignment',
-        headline: `${nextAssn.courseName} · ${nextAssn.title}`,
-        contextTime: `Deadline: ${timing}`,
-        detail: 'Academic course deadline',
-        urgency: diffDays === 0 ? 'today' : diffDays === 1 ? 'tomorrow' : 'soon',
-        link: nextAssn.alternateLink,
-      };
-    }
-  } else if (nextCal) {
+  if (futureCalendarEvents.length > 0) {
+    // 1. Prioritize live calendar event
+    const nextCal = futureCalendarEvents[0];
     const isClass = nextCal.title.toLowerCase().includes('lecture') || nextCal.title.toLowerCase().includes('class');
     const cleanTitle = cleanCalendarTitle(nextCal.title);
     const timing = formatRelativeTiming(nextCal.occurredAt, timeZone, nextCal.timeString);
-    const diffDays = Math.ceil((nextCal.occurredAt - nowMs) / 86400000);
+    const diffDays = Math.max(0, Math.ceil((nextCal.occurredAt - nowMs) / 86400000));
 
     upNext = {
       id: `upnext_${nextCal.id}`,
@@ -167,12 +151,28 @@ export function synthesizeBriefing(options: {
       headline: cleanTitle,
       contextTime: timing,
       detail: nextCal.detail,
-      urgency: diffDays === 0 ? 'now' : diffDays === 1 ? 'tomorrow' : 'soon',
+      urgency: diffDays === 0 ? 'now' : diffDays === 1 ? 'today' : 'soon',
       link: nextCal.link,
     };
-  } else if (nextAssn) {
+    upNextSourceId = nextCal.id;
+  } else if (activeReminders.length > 0) {
+    // 2. Highest-priority active reminder (e.g. India flights or other high priority plan)
+    const topRem = activeReminders.find((r) => r.priority === 'high') || activeReminders[0];
+    const isFlight = topRem.is_travel || topRem.title.toLowerCase().includes('flight');
+
+    upNext = {
+      id: `upnext_rem_${topRem.id}`,
+      category: isFlight ? 'travel' : 'reminder',
+      headline: topRem.title,
+      contextTime: topRem.target_date ? `Target: ${topRem.target_date}` : 'Active Reminder',
+      detail: topRem.details || topRem.context || 'High-priority personal reminder',
+      urgency: 'soon',
+    };
+    upNextSourceId = topRem.id;
+  } else if (futureAssignments.length > 0) {
+    const nextAssn = futureAssignments[0];
     const timing = formatRelativeTiming(nextAssn.dueTimestampMs || nowMs, timeZone, nextAssn.dueTimeString);
-    const diffDays = Math.ceil(((nextAssn.dueTimestampMs || nowMs) - nowMs) / 86400000);
+    const diffDays = Math.max(0, Math.ceil(((nextAssn.dueTimestampMs || nowMs) - nowMs) / 86400000));
 
     upNext = {
       id: `upnext_assn_${nextAssn.id}`,
@@ -183,30 +183,23 @@ export function synthesizeBriefing(options: {
       urgency: diffDays === 0 ? 'today' : diffDays === 1 ? 'tomorrow' : 'soon',
       link: nextAssn.alternateLink,
     };
-  } else if (travelTrip && !travelTrip.flights_booked) {
+    upNextSourceId = nextAssn.id;
+  } else {
+    // 3. Useful contextual status message
     upNext = {
-      id: `upnext_travel_${travelTrip.id}`,
-      category: 'travel',
-      headline: travelTrip.title,
-      contextTime: 'Target: 2nd–3rd week of Nov',
-      detail: 'Trip dates: Jan 5 – Apr 5, 2027 · Book before fares rise',
+      id: 'upnext_clear',
+      category: 'event',
+      headline: 'Schedule Clear',
+      contextTime: 'No upcoming events',
+      detail: 'All commitments and active reminders are up to date.',
       urgency: 'soon',
     };
-  } else if (activeReminders.length > 0) {
-    const rem = activeReminders[0];
-    upNext = {
-      id: `upnext_rem_${rem.id}`,
-      category: 'reminder',
-      headline: rem.title,
-      contextTime: rem.target_date ? `Target: ${rem.target_date}` : 'Active Plan',
-      detail: rem.details || rem.context,
-      urgency: 'soon',
-    };
+    upNextSourceId = 'clear';
   }
 
   // 6. Dynamic Personal Opening Summary
   const sentences: string[] = [];
-  const attentionItems: AttentionItem[] = [];
+  const rawAttentionItems: AttentionItem[] = [];
   const scheduleClear = futureCalendarEvents.length === 0 && futureAssignments.length === 0;
 
   // Sentence 1: Today's status or the next genuine commitment
@@ -254,7 +247,7 @@ export function synthesizeBriefing(options: {
       const timing = formatRelativeTiming(nextAs.dueTimestampMs || nowMs, timeZone, nextAs.dueTimeString);
       sentences.push(`Your schedule is open today. Your next deadline is ${nextAs.courseName} (${nextAs.title}), ${timing}.`);
     } else {
-      sentences.push("Your schedule is completely clear with no upcoming appointments or classes.");
+      sentences.push("Your schedule is clear with no immediate appointments.");
     }
 
     if (scheduleGapNote) {
@@ -262,11 +255,22 @@ export function synthesizeBriefing(options: {
     }
   }
 
-  // Sentence 2: Deadlines & Assignments
-  if (dueTodayAssignments.length > 0) {
+  // Sentence 2: High-priority verified email insights or academic deadlines
+  if (emailInsights.length > 0 && emailInsights[0].isHighPriority) {
+    const topEmail = emailInsights[0];
+    sentences.push(`New high-priority notice: ${topEmail.subject}.`);
+    rawAttentionItems.push({
+      id: `att_email_${topEmail.id}`,
+      type: 'email_action',
+      title: topEmail.subject,
+      subtitle: `${topEmail.sender} · ${topEmail.summary}`,
+      urgency: 'high',
+      actionType: 'open_link',
+    });
+  } else if (dueTodayAssignments.length > 0) {
     const top = dueTodayAssignments[0];
     sentences.push(`Your ${top.courseName} assignment is due today at ${top.dueTimeString}.`);
-    attentionItems.push({
+    rawAttentionItems.push({
       id: `att_assign_${top.id}`,
       type: 'assignment_due',
       title: `${top.courseName} assignment due today`,
@@ -278,7 +282,7 @@ export function synthesizeBriefing(options: {
   } else if (dueTomorrowAssignments.length > 0) {
     const top = dueTomorrowAssignments[0];
     sentences.push(`Your ${top.courseName} assignment is due tomorrow at ${top.dueTimeString}.`);
-    attentionItems.push({
+    rawAttentionItems.push({
       id: `att_assign_${top.id}`,
       type: 'assignment_due',
       title: `${top.courseName} assignment due tomorrow`,
@@ -293,10 +297,13 @@ export function synthesizeBriefing(options: {
     sentences.push(`Your next assignment (${top.courseName}) is due in ${diffDays} days.`);
   }
 
-  // Sentence 3: Life admin, travel, or portfolio summary
-  if (travelTrip && !travelTrip.flights_booked) {
+  // Sentence 3: Active reminders, travel plans, or verified stock movements
+  const meaningfulStock = recentStockMoves.find((s) => s.meaningful);
+  const isTripActive = travelTrip && !travelTrip.completed && !travelTrip.flights_booked && travelTrip.status === 'active';
+
+  if (isTripActive) {
     sentences.push("You planned to book your India flights during the 2nd–3rd week of November.");
-    attentionItems.push({
+    rawAttentionItems.push({
       id: `att_trip_${travelTrip.id}`,
       type: 'travel_prep',
       title: 'Book India flights',
@@ -305,21 +312,15 @@ export function synthesizeBriefing(options: {
       actionId: travelTrip.id,
       actionType: 'confirm_flights',
     });
-  } else if (travelTrip && travelTrip.flights_booked) {
-    sentences.push("India flights are confirmed for Jan 5 – Apr 5.");
-    attentionItems.push({
-      id: `att_trip_prep_${travelTrip.id}`,
-      type: 'travel_prep',
-      title: 'India trip travel preparations',
-      subtitle: 'Flights confirmed · Review packing list & documents for Jan 5 departure',
-      urgency: 'medium',
-      actionId: travelTrip.id,
-      actionType: 'complete_reminder',
-    });
+  } else if (meaningfulStock) {
+    const sign = meaningfulStock.changePct >= 0 ? '+' : '';
+    sentences.push(
+      `${meaningfulStock.companyName} moved ${sign}${meaningfulStock.changePct.toFixed(1)}% on NSE.`
+    );
   } else if (activeReminders.length > 0) {
-    const rem = activeReminders[0];
-    sentences.push(`Reminder active: ${rem.title}.`);
-    attentionItems.push({
+    const rem = activeReminders.find((r) => r.id !== travelTrip?.id) || activeReminders[0];
+    sentences.push(`Active reminder: ${rem.title}.`);
+    rawAttentionItems.push({
       id: `att_rem_${rem.id}`,
       type: 'reminder_active',
       title: rem.title,
@@ -332,10 +333,10 @@ export function synthesizeBriefing(options: {
     sentences.push("Your investment portfolio of 5 holdings stands steady at ₹45,310.11 cost basis.");
   }
 
-  // Fill attention items up to 3
+  // Fill rawAttentionItems up to 3 items with remaining active reminders
   for (const rem of activeReminders) {
-    if (rem.id !== travelTrip?.id && !attentionItems.some((a) => a.actionId === rem.id) && attentionItems.length < 3) {
-      attentionItems.push({
+    if (rem.id !== travelTrip?.id && !rawAttentionItems.some((a) => a.actionId === rem.id) && rawAttentionItems.length < 3) {
+      rawAttentionItems.push({
         id: `att_rem_${rem.id}`,
         type: 'reminder_active',
         title: rem.title,
@@ -346,6 +347,21 @@ export function synthesizeBriefing(options: {
       });
     }
   }
+
+  // CRITICAL RULE: De-duplicate items so nothing shown in "Up Next" appears in "Worth Remembering"
+  const attentionItems = rawAttentionItems.filter((item) => {
+    if (!upNext) return true;
+    if (upNextSourceId && item.actionId && upNextSourceId === item.actionId) {
+      return false;
+    }
+    if (upNext.category === 'travel' && item.type === 'travel_prep') {
+      return false;
+    }
+    if (upNext.id.includes(item.id.replace('att_assign_', '')) || upNext.id.includes(item.id.replace('att_rem_', ''))) {
+      return false;
+    }
+    return true;
+  });
 
   const finalSentences = sentences.slice(0, 3);
 

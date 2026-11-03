@@ -42,9 +42,70 @@ const googleProvider = new GoogleAuthProvider();
 googleProvider.addScope('https://www.googleapis.com/auth/calendar.events.readonly');
 googleProvider.addScope('https://www.googleapis.com/auth/classroom.courses.readonly');
 googleProvider.addScope('https://www.googleapis.com/auth/classroom.coursework.me.readonly');
+googleProvider.addScope('https://www.googleapis.com/auth/gmail.readonly');
 googleProvider.setCustomParameters({
   prompt: 'select_account',
 });
+
+// Multi-account Google OAuth storage
+export interface ConnectedGoogleAccount {
+  id: string; // unique email
+  email: string;
+  name: string;
+  photoURL?: string;
+  accessToken: string;
+  connectedAt: number;
+  isTokenExpired?: boolean;
+}
+
+const MULTI_GOOGLE_ACCOUNTS_KEY = 'kairo_connected_google_accounts';
+
+export const getConnectedGoogleAccounts = (): ConnectedGoogleAccount[] => {
+  try {
+    const raw = localStorage.getItem(MULTI_GOOGLE_ACCOUNTS_KEY);
+    if (!raw) return [];
+    const accounts = JSON.parse(raw);
+    return Array.isArray(accounts) ? accounts : [];
+  } catch {
+    return [];
+  }
+};
+
+export const saveConnectedGoogleAccount = (acc: ConnectedGoogleAccount) => {
+  try {
+    const accounts = getConnectedGoogleAccounts();
+    const existingIndex = accounts.findIndex((a) => a.email.toLowerCase() === acc.email.toLowerCase());
+    if (existingIndex >= 0) {
+      accounts[existingIndex] = { ...accounts[existingIndex], ...acc, isTokenExpired: false };
+    } else {
+      accounts.push(acc);
+    }
+    localStorage.setItem(MULTI_GOOGLE_ACCOUNTS_KEY, JSON.stringify(accounts));
+  } catch (err) {
+    console.warn('Failed to save connected Google account:', err);
+  }
+};
+
+export const removeConnectedGoogleAccount = (email: string) => {
+  try {
+    const accounts = getConnectedGoogleAccounts();
+    const filtered = accounts.filter((a) => a.email.toLowerCase() !== email.toLowerCase());
+    localStorage.setItem(MULTI_GOOGLE_ACCOUNTS_KEY, JSON.stringify(filtered));
+  } catch (err) {
+    console.warn('Failed to remove connected Google account:', err);
+  }
+};
+
+export const markAccountTokenExpired = (email: string, expired: boolean) => {
+  try {
+    const accounts = getConnectedGoogleAccounts();
+    const target = accounts.find((a) => a.email.toLowerCase() === email.toLowerCase());
+    if (target) {
+      target.isTokenExpired = expired;
+      localStorage.setItem(MULTI_GOOGLE_ACCOUNTS_KEY, JSON.stringify(accounts));
+    }
+  } catch {}
+};
 
 // Configure GitHub Provider
 const githubProvider = new GithubAuthProvider();
@@ -88,6 +149,7 @@ export const getAccessToken = (): string | null => {
   } catch {}
   return null;
 };
+
 
 const GITHUB_IDENTITY_KEY = 'kairo_github_identity';
 
@@ -245,6 +307,18 @@ export const googleSignIn = async (options?: { forceDirectSignIn?: boolean }): P
       setCachedAccessToken(token);
     }
 
+    if (resultUser && resultUser.email) {
+      saveConnectedGoogleAccount({
+        id: resultUser.email,
+        email: resultUser.email,
+        name: resultUser.displayName || resultUser.email.split('@')[0],
+        photoURL: resultUser.photoURL || undefined,
+        accessToken: token,
+        connectedAt: Date.now(),
+        isTokenExpired: false,
+      });
+    }
+
     return { user: resultUser, accessToken: token };
   } catch (error: any) {
     if (
@@ -264,6 +338,58 @@ export const googleSignIn = async (options?: { forceDirectSignIn?: boolean }): P
     }
     console.error('Google sign-in error:', error);
     throw error;
+  }
+};
+
+/**
+ * Connect an additional Google / Gmail account independently.
+ * Prompts Google account chooser and stores account under `kairo_connected_google_accounts`.
+ */
+export const connectAdditionalGoogleAccount = async (): Promise<ConnectedGoogleAccount | null> => {
+  try {
+    const provider = new GoogleAuthProvider();
+    provider.addScope('https://www.googleapis.com/auth/calendar.events.readonly');
+    provider.addScope('https://www.googleapis.com/auth/classroom.courses.readonly');
+    provider.addScope('https://www.googleapis.com/auth/classroom.coursework.me.readonly');
+    provider.addScope('https://www.googleapis.com/auth/gmail.readonly');
+    provider.setCustomParameters({
+      prompt: 'select_account',
+    });
+
+    const result = await signInWithPopup(auth, provider);
+    const cred = GoogleAuthProvider.credentialFromResult(result);
+    const token =
+      cred?.accessToken ||
+      (result as any)?._tokenResponse?.oauthAccessToken ||
+      (result as any)?._tokenResponse?.accessToken ||
+      '';
+
+    if (result.user && result.user.email) {
+      const acc: ConnectedGoogleAccount = {
+        id: result.user.email,
+        email: result.user.email,
+        name: result.user.displayName || result.user.email.split('@')[0],
+        photoURL: result.user.photoURL || undefined,
+        accessToken: token,
+        connectedAt: Date.now(),
+        isTokenExpired: false,
+      };
+      saveConnectedGoogleAccount(acc);
+      if (token) {
+        setCachedAccessToken(token);
+      }
+      return acc;
+    }
+    return null;
+  } catch (err: any) {
+    if (
+      err?.code === 'auth/popup-closed-by-user' ||
+      err?.code === 'auth/cancelled-popup-request'
+    ) {
+      return null;
+    }
+    console.error('Failed to connect additional Google account:', err);
+    throw err;
   }
 };
 

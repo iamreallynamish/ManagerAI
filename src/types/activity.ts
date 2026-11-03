@@ -1,7 +1,7 @@
-export type ActivitySource = 'spend_iq' | 'calendar' | 'classroom' | 'stocks' | 'reminder' | 'system';
+export type ActivitySource = 'spend_iq' | 'calendar' | 'classroom' | 'stocks' | 'reminder' | 'email' | 'system';
 
 export interface KairoActivity {
-  id: string;                      // `tx_${tx.id}`, `cal_${event.id}`, `class_${work.id}`, `stock_${symbol}`, `rem_${rem.id}`
+  id: string;                      // `tx_${tx.id}`, `cal_${event.id}`, `class_${work.id}`, `stock_${symbol}`, `rem_${rem.id}`, `email_${id}`
   source: ActivitySource;
   activityType?:
     | 'transaction'
@@ -12,7 +12,8 @@ export interface KairoActivity {
     | 'assignment'
     | 'stock_move'
     | 'reminder'
-    | 'travel';
+    | 'travel'
+    | 'email_alert';
   title: string;                   // E.g. "You spent ¥226 at 7-ELEVEN." or "Economics Assignment due tomorrow"
   detail?: string;                 // Context e.g. "ICICI Forex XX0817 · Convenience Store" or "Macroeconomics · Due 11:59 PM"
   amount?: {
@@ -137,7 +138,7 @@ export interface ClassroomAssignment {
 
 export interface AttentionItem {
   id: string;
-  type: 'assignment_due' | 'reminder_active' | 'schedule_change' | 'travel_prep' | 'stock_alert';
+  type: 'assignment_due' | 'reminder_active' | 'schedule_change' | 'travel_prep' | 'stock_alert' | 'email_action';
   title: string;
   subtitle?: string;
   urgency: 'high' | 'medium';
@@ -158,7 +159,7 @@ export interface UpNextItem {
 
 export interface SinceLastCheckedItem {
   id: string;
-  source: 'calendar' | 'classroom' | 'spend_iq' | 'stocks' | 'reminder';
+  source: 'calendar' | 'classroom' | 'spend_iq' | 'stocks' | 'reminder' | 'email';
   title: string;
   subtitle?: string;
   timestamp: number;

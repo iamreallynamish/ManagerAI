@@ -21,7 +21,13 @@ import {
 } from 'lucide-react';
 import { User } from 'firebase/auth';
 import { triggerHaptic } from '../utils/haptics';
-import { getLinkedProviders } from '../services/auth';
+import {
+  getLinkedProviders,
+  getConnectedGoogleAccounts,
+  removeConnectedGoogleAccount,
+  connectAdditionalGoogleAccount,
+  ConnectedGoogleAccount,
+} from '../services/auth';
 import { USER_PORTFOLIO_HOLDINGS, TOTAL_PORTFOLIO_COST_BASIS } from '../services/stockService';
 
 interface SettingsModalProps {
@@ -92,6 +98,39 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const handleToggleLedger = (val: boolean) => {
     triggerHaptic('selection');
     onToggleShowAllSpenders(val);
+  };
+
+  const [googleAccounts, setGoogleAccounts] = React.useState<ConnectedGoogleAccount[]>(() =>
+    getConnectedGoogleAccounts()
+  );
+
+  React.useEffect(() => {
+    if (isOpen) {
+      setGoogleAccounts(getConnectedGoogleAccounts());
+    }
+  }, [isOpen]);
+
+  const handleAddAccount = async () => {
+    try {
+      triggerHaptic('selection');
+      const acc = await connectAdditionalGoogleAccount();
+      if (acc) {
+        setGoogleAccounts(getConnectedGoogleAccounts());
+        onManualRefresh();
+      }
+    } catch (err: any) {
+      console.warn('Error connecting additional account:', err);
+    }
+  };
+
+  const handleRemoveAccount = (email: string) => {
+    triggerHaptic('light');
+    removeConnectedGoogleAccount(email);
+    setGoogleAccounts(getConnectedGoogleAccounts());
+    if (onDisconnectGoogle && googleAccounts.length <= 1) {
+      onDisconnectGoogle();
+    }
+    onManualRefresh();
   };
 
   const [diagnostics, setDiagnostics] = React.useState<any>(null);
@@ -367,82 +406,116 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   </span>
                 </div>
 
-                {/* Primary Google Calendar & Classroom */}
-                <div className="p-3 bg-white dark:bg-[#2C2C2E] rounded-xl border border-black/[0.04] dark:border-white/[0.06]">
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="min-w-0 pr-2">
-                      <div className="flex items-center gap-2">
-                        <Calendar className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" />
-                        <span className="text-[13px] font-semibold text-neutral-900 dark:text-neutral-100">
-                          Google Calendar & Classroom
-                        </span>
-                      </div>
-                      <div className="mt-1 flex items-center gap-1.5 text-[12px] text-neutral-600 dark:text-neutral-400 truncate">
-                        {isGoogleActive ? (
-                          <>
-                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
-                            <span className="truncate">{linked.googleEmail || user?.email || 'Connected'} · Active</span>
-                          </>
-                        ) : hasEverLinkedGoogle ? (
-                          <>
-                            <AlertCircle className="w-3.5 h-3.5 text-amber-500 shrink-0" />
-                            <span className="text-amber-600 dark:text-amber-400">Token expired — reconnect for schedule</span>
-                          </>
-                        ) : (
-                          <span>Sync today & upcoming classes and assignments</span>
-                        )}
-                      </div>
-                    </div>
+                {/* Connected Google Accounts List */}
+                {googleAccounts.length > 0 ? (
+                  <div className="space-y-2">
+                    {googleAccounts.map((acc) => (
+                      <div
+                        key={acc.email}
+                        className="p-3 bg-white dark:bg-[#2C2C2E] rounded-xl border border-black/[0.04] dark:border-white/[0.06] flex items-center justify-between gap-2"
+                      >
+                        <div className="min-w-0 pr-2">
+                          <div className="flex items-center gap-2">
+                            <Mail className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" />
+                            <span className="text-[13px] font-semibold text-neutral-900 dark:text-neutral-100 truncate">
+                              {acc.name || acc.email.split('@')[0]}
+                            </span>
+                          </div>
+                          <div className="mt-1 flex items-center gap-1.5 text-[12px] truncate">
+                            {acc.isTokenExpired ? (
+                              <>
+                                <AlertCircle className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+                                <span className="text-amber-600 dark:text-amber-400 truncate">
+                                  Token expired — reconnect
+                                </span>
+                              </>
+                            ) : (
+                              <>
+                                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
+                                <span className="text-neutral-600 dark:text-neutral-400 truncate">
+                                  {acc.email} · Active
+                                </span>
+                              </>
+                            )}
+                          </div>
+                        </div>
 
-                    {isGoogleActive ? (
-                      <button
-                        onClick={onDisconnectGoogle || onSignOut}
-                        className="min-h-[34px] px-3 flex items-center gap-1 text-[12px] font-medium text-red-600 dark:text-red-400 hover:bg-red-500/10 rounded-lg active:scale-95 transition-all shrink-0 cursor-pointer"
-                      >
-                        <LogOut className="w-3.5 h-3.5" />
-                        <span>Disconnect</span>
-                      </button>
-                    ) : (
-                      <button
-                        onClick={() => {
-                          handleDismiss();
-                          onConnectCalendar();
-                        }}
-                        className="min-h-[34px] px-3.5 text-[12px] font-semibold bg-blue-600 hover:bg-blue-700 active:scale-95 text-white rounded-xl transition-all cursor-pointer shadow-xs shrink-0"
-                      >
-                        {hasEverLinkedGoogle ? 'Reconnect' : 'Connect'}
-                      </button>
-                    )}
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          {acc.isTokenExpired && (
+                            <button
+                              onClick={handleAddAccount}
+                              className="min-h-[32px] px-2.5 text-[11px] font-semibold bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-all cursor-pointer"
+                            >
+                              Reconnect
+                            </button>
+                          )}
+                          <button
+                            onClick={() => handleRemoveAccount(acc.email)}
+                            className="min-h-[32px] px-2.5 flex items-center gap-1 text-[11px] font-medium text-red-600 dark:text-red-400 hover:bg-red-500/10 rounded-lg active:scale-95 transition-all cursor-pointer"
+                            title="Disconnect account"
+                          >
+                            <LogOut className="w-3.5 h-3.5" />
+                            <span>Disconnect</span>
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+
+                    <button
+                      onClick={handleAddAccount}
+                      className="w-full py-2.5 px-3 flex items-center justify-center gap-1.5 text-[12px] font-semibold bg-white dark:bg-[#2C2C2E] hover:bg-neutral-50 dark:hover:bg-neutral-800 text-neutral-800 dark:text-neutral-200 border border-black/[0.05] dark:border-white/[0.06] rounded-xl active:scale-98 transition-all cursor-pointer"
+                    >
+                      <Plus className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+                      <span>Add another Google Account</span>
+                    </button>
                   </div>
-                </div>
+                ) : (
+                  <div className="space-y-2">
+                    <div className="p-3 bg-white dark:bg-[#2C2C2E] rounded-xl border border-black/[0.04] dark:border-white/[0.06] flex items-center justify-between gap-2">
+                      <div className="min-w-0 pr-2">
+                        <div className="flex items-center gap-2">
+                          <Calendar className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0" />
+                          <span className="text-[13px] font-semibold text-neutral-900 dark:text-neutral-100">
+                            Google Calendar, Classroom & Gmail
+                          </span>
+                        </div>
+                        <div className="mt-1 text-[12px] text-neutral-500 dark:text-neutral-400">
+                          {hasEverLinkedGoogle && isGoogleActive
+                            ? `${linked.googleEmail || user?.email || 'Connected'} · Active`
+                            : 'Sync schedules, assignments, and verified email notices'}
+                        </div>
+                      </div>
 
-                {/* Additional Gmail Accounts connection action */}
-                <div className="p-3 bg-white dark:bg-[#2C2C2E] rounded-xl border border-black/[0.04] dark:border-white/[0.06]">
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="min-w-0 pr-2">
-                      <div className="flex items-center gap-2">
-                        <Mail className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0" />
-                        <span className="text-[13px] font-semibold text-neutral-900 dark:text-neutral-100">
-                          Additional Gmail Accounts
-                        </span>
-                      </div>
-                      <div className="mt-1 text-[12px] text-neutral-500 dark:text-neutral-400">
-                        Connect university or secondary Gmail accounts independently
-                      </div>
+                      {hasEverLinkedGoogle && isGoogleActive ? (
+                        <button
+                          onClick={onDisconnectGoogle || onSignOut}
+                          className="min-h-[34px] px-3 flex items-center gap-1 text-[12px] font-medium text-red-600 dark:text-red-400 hover:bg-red-500/10 rounded-lg active:scale-95 transition-all shrink-0 cursor-pointer"
+                        >
+                          <LogOut className="w-3.5 h-3.5" />
+                          <span>Disconnect</span>
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() => {
+                            handleDismiss();
+                            onConnectCalendar();
+                          }}
+                          className="min-h-[34px] px-3.5 text-[12px] font-semibold bg-blue-600 hover:bg-blue-700 active:scale-95 text-white rounded-xl transition-all cursor-pointer shadow-xs shrink-0"
+                        >
+                          {hasEverLinkedGoogle ? 'Reconnect' : 'Connect'}
+                        </button>
+                      )}
                     </div>
 
                     <button
-                      onClick={() => {
-                        handleDismiss();
-                        onConnectCalendar();
-                      }}
-                      className="min-h-[34px] px-3 flex items-center gap-1 text-[12px] font-semibold bg-neutral-100 dark:bg-neutral-800 hover:bg-neutral-200 dark:hover:bg-neutral-700 text-neutral-800 dark:text-neutral-200 rounded-xl active:scale-95 transition-all shrink-0 cursor-pointer"
+                      onClick={handleAddAccount}
+                      className="w-full py-2.5 px-3 flex items-center justify-center gap-1.5 text-[12px] font-semibold bg-white dark:bg-[#2C2C2E] hover:bg-neutral-50 dark:hover:bg-neutral-800 text-neutral-800 dark:text-neutral-200 border border-black/[0.05] dark:border-white/[0.06] rounded-xl active:scale-98 transition-all cursor-pointer"
                     >
-                      <Plus className="w-3.5 h-3.5" />
-                      <span>Add Account</span>
+                      <Plus className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+                      <span>Add Google Account</span>
                     </button>
                   </div>
-                </div>
+                )}
 
                 {/* GitHub Account */}
                 <div className="p-3 bg-white dark:bg-[#2C2C2E] rounded-xl border border-black/[0.04] dark:border-white/[0.06]">

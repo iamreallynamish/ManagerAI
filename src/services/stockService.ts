@@ -151,6 +151,16 @@ export const WATCHLIST_REGISTRY: WatchlistStockIdentity[] = [
     currency: 'INR',
     significanceThresholdPct: 3.0,
   },
+  {
+    ticker: 'TATACAPITAL',
+    exchange: 'BSE',
+    companyName: 'Tata Capital Limited',
+    dataProviderSymbol: 'TATACAP.BO',
+    isin: 'INE306N01018',
+    market: 'India',
+    currency: 'INR',
+    significanceThresholdPct: 3.0,
+  },
 ];
 
 export interface MarketStatus {
